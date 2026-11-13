@@ -176,6 +176,58 @@ class TestDomainIsolation(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
         self.assertIn("base", res.stdout.lower())
 
+    def test_05_interactive_domain_init_wizard(self):
+        # Create dummy QAD template file to be copied by wizard
+        src_qad = self.tmp_root / "corp-qad.docx"
+        src_qad.write_bytes(b"PK\x05\x06" + b"\x00" * 18)
+
+        answers = "\n".join([
+            "Delta Corp",                          # Organization name
+            "Delta Engineering Domain",            # Display name
+            "Platform & QA",                       # Division
+            "#004D40",                             # Brand color
+            "Confidential Delta Corp.",            # Notice
+            "QA Manager:Alice;Dept Head:Bob",      # Officials
+            "delta-api",                           # App ID
+            "Delta Gateway Service",               # App name
+            "https://dev.delta.local,https://admin.delta.local",  # Internal domains
+            str(src_qad),                          # QAD docx template path
+            "",                                    # External ref dir
+            "https://git.delta.local/starter.git", # Boilerplate URL
+            "service",                             # Boilerplate type
+            "y",                                   # Activate & sync now
+        ]) + "\n"
+
+        res = subprocess.run(
+            [sys.executable, str(TEAM_ORCH), "domain", "init", "delta-corp", "--interactive"],
+            cwd=str(self.ws_dir),
+            env=self.env,
+            input=answers,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
+        dom_dir = self.ws_dir / ".agents" / "domains" / "delta-corp"
+        self.assertTrue((dom_dir / "domain.yaml").is_file())
+        self.assertTrue((dom_dir / "templates" / "qad-template.docx").is_file())
+        self.assertTrue((self.home_dir / ".gemini" / "team-orch" / "domains" / "delta-corp" / "domain.yaml").is_file())
+
+        domain_yaml = (dom_dir / "domain.yaml").read_text(encoding="utf-8")
+        self.assertIn("Delta Corp", domain_yaml)
+        self.assertIn("Alice", domain_yaml)
+        self.assertIn("https://dev.delta.local", domain_yaml)
+
+        bp_yaml = (dom_dir / "boilerplates.yaml").read_text(encoding="utf-8")
+        self.assertIn("https://git.delta.local/starter.git", bp_yaml)
+
+        # Must already be active domain and pass validation
+        res_cur = self._run_orch("domain", "current")
+        self.assertEqual(res_cur.returncode, 0)
+        self.assertIn("delta-corp", res_cur.stdout)
+
+        res_val = self._run_orch("domain", "validate", "delta-corp")
+        self.assertEqual(res_val.returncode, 0, res_val.stderr + res_val.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

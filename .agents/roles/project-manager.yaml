@@ -6,6 +6,7 @@ herdr_pane_preference: "control_room"
 
 skills:
   - "agent-governance"
+  - "domain-onboarding"
   - "office-document-suite"
 
 capabilities:

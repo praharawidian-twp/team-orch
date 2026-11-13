@@ -229,7 +229,7 @@ echo -e "    • Active Domain Default : ${CYAN}base${NC} (Day-1 Zero Institutio
 echo -e "    • Domain Pack Store     : ${INSTALL_DIR}/domains/ (dan .agents/domains/ per repo)"
 echo -e "    • Kelola / Switch Domain: ${YELLOW}team-orch domain list | use <id> | init <id>${NC}"
 echo -e "\n${BLUE}[*] Bundled Skills Bawaan (Siap Pakai):${NC}"
-echo -e "    • Governance & Ops  : agent-governance, devsecops-guardian, herdr-orchestrator"
+echo -e "    • Governance & Ops  : agent-governance, devsecops-guardian, domain-onboarding, herdr-orchestrator"
 echo -e "    • Engineering & QA  : tech-lead-analyst, qa-test-specialist, ui-evidence-capture, office-document-suite"
 echo -e "    • ECC Suite Bundle  : ecc, ecc-guide, ecc-recipes (verification, TDD, context budget)"
 echo -e "    • Meta & Discovery  : .agents/meta-studio/ (upgrade & cetak biru agen/skill baru)"

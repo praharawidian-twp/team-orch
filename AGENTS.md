@@ -56,6 +56,7 @@
   - **Tooling & CLI Discipline**: Selalu gunakan tool resmi di `./cmd/` (`team-orch`, `herdr-orch`, `agy-auto`, `sync-boilerplates`). Dilarang membuat skrip liar di root workspace (gunakan `.agents/tasks/active/<project_id>/scratch/` untuk skrip sementara).
   - **2-Domain Isolation & Anti-Hallucination Context Binding**:
     - Framework memisahkan Base Domain (publik, zero institutional data) dan Specific Domain Packs (`.agents/domains/<domain_id>/` ter-gitignore + `~/.gemini/team-orch/domains/`).
+    - **Just-in-Time Domain Onboarding**: Bila domain aktif masih `base` dan pengguna meminta pekerjaan yang menyiratkan standar/template/portal/boilerplate institusi tertentu, jalankan wawancara terstruktur skill `.agents/skills/domain-onboarding/SKILL.md` (pola `/grill-me`) atau `team-orch domain init <id> --interactive` terlebih dahulu, atau konfirmasi lanjut dalam mode `base`.
     - Setiap eksekusi proyek WAJIB memverifikasi `team-orch domain current` dan memastikan kesesuaian `domain_id` pada `project.yaml`. Jangan pernah mencampurkan aset/template/boilerplates dari domain yang tidak sedang aktif.
   - **File-Driven Communication**: Seluruh penyerahan tugas wajib menggunakan file `task-handoff.md` dengan pemicu terminal minimalis (1-2 baris). Dilarang menempelkan wall-of-text di terminal agen lain.
   - **Workspace Stirring & Confinement**: Agen dibatasi hanya boleh menulis pada `target_dir` (kode sumber), folder task aktif `.agents/tasks/active/<project_id>/`, dan `.drafts/`. Dilarang memodifikasi framework `cmd/` atau memutasi status git.

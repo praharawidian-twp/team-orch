@@ -125,6 +125,7 @@ To maximize token economy and avoid premature quota exhaustion, dynamically sele
 
 ## 13. 2-Domain Isolation & Multi-Domain Switch Guardrails
 - **Strict Separation**: Base Domain contains zero institutional secrets, logos, internal URLs, or organization names. Company-specific templates, approvers, internal domains, and custom boilerplates belong exclusively in gitignored Specific Domain Packs (`.agents/domains/<domain_id>/` or `~/.gemini/team-orch/domains/<domain_id>/`).
+- **Just-in-Time Domain Onboarding (`/grill-me`)**: When active domain is `base` on Day-1 and the user first requests a company-bound task, follow `.agents/skills/domain-onboarding/SKILL.md` to offer a concise interactive interview (`/grill-me` / `team-orch domain init <id> --interactive`) before proceeding—or confirm continuing cleanly in generic `base` mode.
 - **Context Binding**: Always verify the active domain (`team-orch domain current`) matches the project's pinned `domain_id` (`project.yaml`) to prevent cross-domain context bleed and agent hallucination. Switch domains cleanly via `team-orch domain use <domain_id|base>`.
 
 

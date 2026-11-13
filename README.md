@@ -171,7 +171,7 @@ source cmd/env.sh
 
 ### Bundled Skills Bawaan (Saat Instalasi Pertama):
 Framework ini membawa paket skill siap pakai di `.agents/skills/` (disalin ke `~/.gemini/team-orch/skills/` saat instalasi):
-- **Governance & Orchestration**: `agent-governance`, `devsecops-guardian`, `herdr-orchestrator`, `team-orchestrator`
+- **Governance & Orchestration**: `agent-governance`, `devsecops-guardian`, `domain-onboarding`, `herdr-orchestrator`, `team-orchestrator`
 - **Engineering & QA**: `tech-lead-analyst`, `qa-test-specialist`, `ui-evidence-capture`, `office-document-suite`
 - **Everything Claude Code (ECC) Bundle**: `ecc`, `ecc-guide`, `ecc-recipes` (verification loops, TDD, context budget, strategic compact)
 - **Meta & Discovery**: `.agents/meta-studio/` (`agent-builder`, blueprint role/skill upgrade)
@@ -247,7 +247,7 @@ team-orch workflow create <id> --name <n>            # Buat alur kerja kustom ba
 # === MANAJEMEN DOMAIN (2-DOMAIN ISOLATION & SWITCHING) ===
 team-orch domain list                                # Daftar domain (base + specific domain packs)
 team-orch domain current                             # Cek active domain & context binding saat ini
-team-orch domain init <id> --org <org>               # Buat skeleton Specific Domain Pack baru
+team-orch domain init <id> --org <org> [-i]          # Buat Specific Domain Pack (opsi -i wizard interaktif)
 team-orch domain use <id|base>                       # Switch active domain pack global
 team-orch domain bind <project_id> <id|base>         # Ikat proyek ke domain spesifik
 team-orch domain validate [<id>]                     # Audit kelengkapan domain pack

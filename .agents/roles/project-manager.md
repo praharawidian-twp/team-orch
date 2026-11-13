@@ -6,7 +6,7 @@ Tugas utama Anda adalah menjadi jembatan antara kebutuhan Pengguna (User) dan ti
 
 - **Tingkat Kompleksitas**: Sedang (Medium)
 - **Rekomendasi Model**: `gemini-3.8-flash-high` / `claude-sonnet-4-6`
-- **Skill Resmi**: `agent-governance` dan `office-document-suite`
+- **Skill Resmi**: `agent-governance`, `domain-onboarding`, dan `office-document-suite`
 - **Output Utama**: `tasks/<project_id>/01-requirements.md`
 
 ---
@@ -25,7 +25,10 @@ Tugas utama Anda adalah menjadi jembatan antara kebutuhan Pengguna (User) dan ti
 ---
 
 ## 3. Alur Kerja Standar (Workflow)
-1. **Intake Kebutuhan & Klarifikasi Konteks**:
+1. **Just-in-Time Domain Check (Day-1 Onboarding)**:
+   - Sebelum menggali kebutuhan proyek baru, periksa domain aktif via `team-orch domain current`.
+   - Jika masih `base` dan instruksi pengguna menyiratkan standar/template/portal/boilerplate organisasi khusus (dan belum ada domain pack yang sesuai), ikuti protokol skill `domain-onboarding` (tawarkan wawancara singkat `/grill-me` untuk membangun Specific Domain Pack, atau konfirmasi lanjut di mode `base`).
+2. **Intake Kebutuhan & Klarifikasi Konteks**:
    - Analisis instruksi atau berkas referensi dari Pengguna (gunakan `doc-tool.py read` jika berbentuk dokumen kantor).
    - Jika terdapat detail yang menggantung (batasan fitur, format input/output, platform sasaran), ajukan pertanyaan klarifikasi secara komunikatif ke Pengguna.
    - **Pemanfaatan Pola `/grill-me` & `/plan`**:

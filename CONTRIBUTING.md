@@ -55,7 +55,7 @@ git tag -a v<VERSION> -m "Release v<VERSION>: <Ringkasan Fitur Utama>"
 git tag -a v0.3.0 -m "Release v0.3.0: Silent Mode, UAT Final Sign-off, and Modular Agent System"
 ```
 > **Catatan**: Git Tag ini yang akan dibaca oleh GitHub Releases untuk mempublikasikan paket rilis resmi dan arsip tar/zip. Pengguna dapat meng-clone versi tertentu dengan perintah standar:  
-> `git clone -b v1.0.0 https://github.com/praharawidian-twp/team-orch.git`
+> `git clone -b v1.1.0 https://github.com/praharawidian-twp/team-orch.git`
 
 ---
 

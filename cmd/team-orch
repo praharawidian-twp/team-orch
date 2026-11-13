@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-team-orch: Autonomous Multi-Agent Team Orchestrator (v0.2.0)
+team-orch: Autonomous Multi-Agent Team Orchestrator (v1.1.0)
 Manages dynamic virtual organization workflows, flexible agent roles, 
 declarative blueprints, artifact handoffs, and Herdr cross-pane orchestration.
 """
@@ -44,7 +44,7 @@ except ImportError:
         SCHEMA_VERSION
     )
 
-VERSION = "0.3.0"
+VERSION = "1.1.0"
 
 # ------------------------------------------------------------------------------
 # 1. Path & Workspace Discovery
@@ -1290,6 +1290,9 @@ def cmd_init(args):
     print(f"   1. Susun kebutuhan di '{project_id}/01-requirements.md'.")
     print(f"   2. Ketik 'team-orch approve {project_id}' untuk menyetujui lingkup kerja.")
     print(f"   3. Ketik 'team-orch next {project_id}' untuk menjalankan tahap berikutnya secara otomatis.")
+    if eff_domain == BASE_DOMAIN_ID:
+        print(f"\n💡 Tips Day-1 (Mode 'base'): Jika proyek ini butuh template berlogo, URL internal, atau boilerplate perusahaan,")
+        print(f"   jalankan 'team-orch domain init <org-id> --interactive' (atau minta agen AI wawancara via /grill-me).")
 
 def cmd_approve(args):
     project_id = args.project_id
@@ -3367,7 +3370,91 @@ def cmd_domain(args):
         org_name = getattr(args, "org", None) or clean_id.replace("-", " ").title()
         disp_name = getattr(args, "name", None) or f"{org_name} Domain Pack"
 
-        if manifest_tmpl.is_file():
+        if getattr(args, "interactive", False):
+            def _ask(prompt_label: str, default: str = "") -> str:
+                suffix = f" [{default}]" if default else ""
+                try:
+                    val = input(f"  ? {prompt_label}{suffix}: ").strip()
+                except EOFError:
+                    val = ""
+                return val if val else default
+
+            print("=" * 72)
+            print(f" 🧭 INTERACTIVE SPECIFIC DOMAIN ONBOARDING: '{clean_id}'")
+            print("    (Kosongkan & tekan Enter untuk menggunakan nilai default/lewati)")
+            print("=" * 72)
+            org_name = _ask("Nama Organisasi / Perusahaan", org_name)
+            disp_name = _ask("Nama Tampilan Domain Pack", f"{org_name} Ecosystem")
+            div_name = _ask("Divisi / Unit TI", "Software Engineering & QA")
+            brand_color = _ask("Brand Color Hex Dokumen", "#1B4D3E")
+            notice = _ask("Confidentiality Notice", f"Internal document belonging to {org_name}.")
+
+            officials: List[Dict[str, str]] = []
+            off_raw = _ask("Pejabat Approver (format 'Role:Nama;Role2:Nama2', opsional)", "")
+            if off_raw:
+                for entry in off_raw.split(";"):
+                    if ":" in entry:
+                        r_k, n_v = entry.split(":", 1)
+                        officials.append({"role": r_k.strip(), "name": n_v.strip(), "title": r_k.strip()})
+
+            apps: List[Dict[str, Any]] = []
+            app_id = _ask("ID Aplikasi Utama (opsional, mis. 'core-api')", "")
+            if app_id:
+                app_name = _ask("Nama Aplikasi", app_id)
+                app_urls_raw = _ask("URL/Origin Internal (pisahkan koma, opsional)", "")
+                app_urls = [u.strip() for u in app_urls_raw.split(",") if u.strip()]
+                apps.append({"id": app_id, "name": app_name, "internal_domains": app_urls})
+
+            qad_src = _ask("Path Template QAD .docx berlogo (opsional)", "")
+            tmpls_cfg: Dict[str, Any] = {"qad_docx": "", "qa_report_md": ""}
+            if qad_src and Path(qad_src).expanduser().is_file():
+                src_p = Path(qad_src).expanduser()
+                shutil.copy2(src_p, target_dir / "templates" / "qad-template.docx")
+                tmpls_cfg["qad_docx"] = "templates/qad-template.docx"
+
+            ext_ref = _ask("Direktori Referensi Template Eksternal (opsional)", "")
+            if ext_ref:
+                tmpls_cfg["external_reference_dir"] = ext_ref
+
+            bp_url = _ask("URL Git Boilerplate Utama (opsional)", "")
+            bp_type = _ask("Tipe Boilerplate (service/frontend/gateway)", "service") if bp_url else "service"
+
+            manifest_data = {
+                "schema_version": "1.0.0",
+                "domain_id": clean_id,
+                "name": disp_name,
+                "description": f"Specific Domain Pack untuk {org_name}.",
+                "version": "1.0.0",
+                "organization": {
+                    "name": org_name,
+                    "division": div_name,
+                    "brand_color": brand_color,
+                    "confidentiality_notice": notice,
+                },
+                "officials": officials,
+                "applications": apps,
+                "templates": tmpls_cfg,
+                "boilerplates_file": "boilerplates.yaml",
+                "knowledge_dir": "knowledge",
+            }
+            (target_dir / "domain.yaml").write_text(dump_yaml(manifest_data) + "\n", encoding="utf-8")
+
+            repos_list = []
+            if bp_url:
+                repos_list.append({
+                    "id": f"{clean_id}-starter",
+                    "name": f"{org_name} Starter Boilerplate",
+                    "url": bp_url,
+                    "type": bp_type,
+                    "discovery_mode": "branches",
+                    "knowledge_topic_id": f"{clean_id}-boilerplate-guide",
+                    "doc_file": f"docs/{clean_id}-boilerplate-guide.md",
+                })
+            (target_dir / "boilerplates.yaml").write_text(
+                dump_yaml({"domain_id": clean_id, "repositories": repos_list}) + "\n",
+                encoding="utf-8",
+            )
+        elif manifest_tmpl.is_file():
             m_txt = manifest_tmpl.read_text(encoding="utf-8")
             m_txt = m_txt.replace("[domain-id]", clean_id)
             m_txt = m_txt.replace("[Nama Organisasi atau Domain Kerja]", disp_name)
@@ -3383,18 +3470,28 @@ def cmd_domain(args):
                 "knowledge_dir": "knowledge",
             }) + "\n", encoding="utf-8")
 
-        bp_tmpl = tmpl_dir / "domain-boilerplates-template.yaml"
-        if bp_tmpl.is_file():
-            b_txt = bp_tmpl.read_text(encoding="utf-8").replace("[domain-id]", clean_id)
-            (target_dir / "boilerplates.yaml").write_text(b_txt, encoding="utf-8")
+        if not getattr(args, "interactive", False):
+            bp_tmpl = tmpl_dir / "domain-boilerplates-template.yaml"
+            if bp_tmpl.is_file():
+                b_txt = bp_tmpl.read_text(encoding="utf-8").replace("[domain-id]", clean_id)
+                (target_dir / "boilerplates.yaml").write_text(b_txt, encoding="utf-8")
 
         (target_dir / "knowledge" / "registry.yaml").write_text(
             dump_yaml({"version": "1.0.0", "knowledge_catalog": []}) + "\n",
             encoding="utf-8"
         )
         print(f"[✓] Specific Domain Pack '{clean_id}' berhasil dibuat di: {target_dir}")
-        print(f"    1. Lengkapi metadata, aplikasi, pejabat & template di: {target_dir}/domain.yaml")
-        print(f"    2. Aktifkan dengan: team-orch domain use {clean_id}")
+        if getattr(args, "interactive", False):
+            activate_now = _ask("Aktifkan & sinkronkan domain ini ke global store sekarang? (y/n)", "y").lower()
+            if activate_now in ("y", "yes"):
+                set_active_domain_id(clean_id)
+                GLOBAL_DOMAINS_DIR.mkdir(parents=True, exist_ok=True)
+                shutil.copytree(target_dir, GLOBAL_DOMAINS_DIR / clean_id, dirs_exist_ok=True)
+                print(f"[✓] Domain '{clean_id}' telah disinkronkan ke {GLOBAL_DOMAINS_DIR / clean_id} dan diaktifkan.")
+        else:
+            print(f"    1. Lengkapi metadata, aplikasi, pejabat & template di: {target_dir}/domain.yaml")
+            print(f"    2. Atau jalankan wizard interaktif: team-orch domain init <id> --interactive")
+            print(f"    3. Aktifkan dengan: team-orch domain use {clean_id}")
 
     elif action == "bind":
         project_id = args.project_id
@@ -3634,6 +3731,7 @@ def main():
     p_dom_init.add_argument("--name", help="Display name for the domain")
     p_dom_init.add_argument("--org", help="Organization name")
     p_dom_init.add_argument("--global", dest="global_scope", action="store_true", help="Create directly in ~/.gemini/team-orch/domains/")
+    p_dom_init.add_argument("-i", "--interactive", action="store_true", help="Run interactive onboarding interview to populate Specific Domain Pack")
     p_dom_bind = dom_sub.add_parser("bind", help="Bind or rebind a project to a specific domain")
     p_dom_bind.add_argument("project_id", help="Project ID")
     p_dom_bind.add_argument("domain_id", help="Domain ID or 'base'")
