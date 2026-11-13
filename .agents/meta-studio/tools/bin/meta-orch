@@ -1,0 +1,467 @@
+#!/usr/bin/env python3
+"""
+meta-orch: CLI Runner & Orchestrator khusus Meta-Studio (Autonomous Meta-Agent Engineering)
+Mengelola 2 Expert Roles (Meta-Architect & Agent Builder), workflows, skills, MCP, tools,
+serta siklus Self-Improvement Framework.
+
+[v2.0.0] — Self-Improvement Framework Integration
+  - sub-perintah: self-improve scan, status, escalate, diff, rollback, config
+  - Integrasi dengan cmd/self-improve-scan.py (0-token scanner)
+  - Integrasi dengan cmd/self-improve-validate.py (Canary Validator)
+  - Dual-Tier CLI Bridge: meta-orch escalate → meta-agent-evolution workflow
+"""
+
+import os
+import sys
+import json
+import argparse
+import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
+
+# Resolve base directories
+SCRIPT_DIR = Path(__file__).resolve().parent
+META_STUDIO_DIR = SCRIPT_DIR.parent.parent
+AGENTS_DIR = META_STUDIO_DIR.parent
+WORKSPACE_ROOT = AGENTS_DIR.parent
+
+ROLES_DIR = META_STUDIO_DIR / "roles"
+WORKFLOWS_DIR = META_STUDIO_DIR / "workflows"
+SKILLS_DIR = META_STUDIO_DIR / "skills"
+MCP_DIR = META_STUDIO_DIR / "mcp"
+TOOLS_DIR = META_STUDIO_DIR / "tools"
+
+# Self-Improvement paths
+SELF_IMPROVE_DIR = AGENTS_DIR / "tasks" / "active" / "self-improvement"
+SIGNALS_PATH = SELF_IMPROVE_DIR / "signals.json"
+CONFIG_PATH = AGENTS_DIR / "config" / "self-improvement.yaml"
+SCAN_SCRIPT = WORKSPACE_ROOT / "cmd" / "self-improve-scan.py"
+VALIDATE_SCRIPT = WORKSPACE_ROOT / "cmd" / "self-improve-validate.py"
+DRAFTS_DIR = AGENTS_DIR / "knowledge" / ".drafts"
+SNAPSHOTS_DIR = AGENTS_DIR / "knowledge" / ".snapshots"
+
+
+# ===========================================================================
+# COMMAND: status
+# ===========================================================================
+
+def cmd_status(args):
+    print("=" * 70)
+    print(" 🛠️  META-STUDIO: AUTONOMOUS AGENT CAPABILITY & EVOLUTION FORGE")
+    print("=" * 70)
+    print(f" Directory  : {META_STUDIO_DIR}")
+    print("\n[🎭 Dedicated Roles (Tier HIGH)]")
+    for r in sorted(ROLES_DIR.glob("*.yaml")):
+        print(f"  • {r.stem} (Spec: roles/{r.name})")
+
+    print("\n[🔄 Dedicated Workflows]")
+    for w in sorted(WORKFLOWS_DIR.glob("*.yaml")):
+        print(f"  • {w.stem} (Workflow: workflows/{w.name})")
+
+    print("\n[🧠 Internal Skills]")
+    if SKILLS_DIR.exists():
+        skills = [d.name for d in SKILLS_DIR.iterdir() if d.is_dir() and not d.name.startswith(".")]
+        if skills:
+            for s in skills:
+                print(f"  • {s}")
+        else:
+            print("  (Belum ada skill tambahan)")
+    else:
+        print("  (Direktori skills belum ada)")
+
+    print("\n[🔌 MCP Servers]")
+    servers_dir = MCP_DIR / "servers"
+    if servers_dir.exists():
+        servers = [d.name for d in servers_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
+        if servers:
+            for s in servers:
+                print(f"  • {s}")
+        else:
+            print("  (Direktori mcp/servers siap digunakan)")
+    else:
+        print("  (Direktori mcp/servers siap digunakan)")
+
+    print("\n[🧰 Dedicated Tools]")
+    bin_dir = TOOLS_DIR / "bin"
+    if bin_dir.exists():
+        tools = [f.name for f in bin_dir.glob("*") if f.is_file() and not f.name.startswith(".")]
+        for t in tools:
+            print(f"  • {t}")
+
+    # Self-Improvement status summary
+    print("\n[🔁 Self-Improvement Framework]")
+    if SIGNALS_PATH.exists():
+        try:
+            signals = json.loads(SIGNALS_PATH.read_text())
+            print(f"  • signals.json   : ✓ Ada (project: {signals.get('project_id', '?')}, score: {signals.get('anomaly_score', '?')})")
+        except Exception:
+            print("  • signals.json   : ✓ Ada (tidak dapat dibaca)")
+    else:
+        print("  • signals.json   : — Belum ada (jalankan: meta-orch self-improve scan)")
+
+    pending_drafts = list(DRAFTS_DIR.glob("**/*.md")) if DRAFTS_DIR.exists() else []
+    print(f"  • Pending drafts : {len(pending_drafts)} draf menunggu Human Approval")
+    print("=" * 70)
+
+
+# ===========================================================================
+# COMMAND: self-improve (sub-command dispatcher)
+# ===========================================================================
+
+def cmd_self_improve_scan(args):
+    """Tier 2 escalation: jalankan 0-token scanner via meta-orch."""
+    print("=" * 70)
+    print(" 🔍 META-STUDIO: Self-Improvement — Signal Scan (0-Token)")
+    print("=" * 70)
+
+    if not SCAN_SCRIPT.exists():
+        print(f"[ERROR] Scanner tidak ditemukan: {SCAN_SCRIPT}")
+        print("        Pastikan cmd/self-improve-scan.py sudah diimplementasikan.")
+        sys.exit(2)
+
+    project = getattr(args, "project", None)
+    if not project:
+        print("[ERROR] --project diperlukan untuk perintah scan.")
+        print("        Usage: meta-orch self-improve scan --project <project_id>")
+        sys.exit(1)
+
+    cmd = [sys.executable, str(SCAN_SCRIPT), "--project", project]
+    if getattr(args, "force", False):
+        cmd.append("--force")
+    if getattr(args, "verbose", False):
+        cmd.append("--verbose")
+    if getattr(args, "dry_run", False):
+        cmd.append("--dry-run")
+
+    print(f"[META-ORCH] Mendelegasikan ke scanner: {' '.join(cmd)}")
+    print()
+    result = subprocess.run(cmd)
+    sys.exit(result.returncode)
+
+
+def cmd_self_improve_status(args):
+    """Tampilkan antrean proposal yang menunggu Human Approval."""
+    print("=" * 70)
+    print(" 📋 META-STUDIO: Self-Improvement — Pending Proposal Queue")
+    print("=" * 70)
+
+    if not DRAFTS_DIR.exists():
+        print("  Tidak ada draf yang tersedia (direktori .drafts/ belum ada).")
+        print("=" * 70)
+        return
+
+    all_drafts = list(DRAFTS_DIR.glob("**/*.md"))
+    if not all_drafts:
+        print("  ✓ Antrean kosong — tidak ada proposal yang menunggu review.")
+        print("=" * 70)
+        return
+
+    print(f"  Total: {len(all_drafts)} draf menunggu review Manusia\n")
+    for draft in sorted(all_drafts, key=lambda p: p.stat().st_mtime, reverse=True):
+        rel_path = draft.relative_to(AGENTS_DIR)
+        mtime = datetime.fromtimestamp(draft.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+        # Baca status dari frontmatter
+        try:
+            content = draft.read_text(encoding="utf-8", errors="replace")
+            import re
+            status_match = re.search(r"^status\s*:\s*(.+)$", content, re.MULTILINE)
+            status = status_match.group(1).strip().strip('"').strip("'") if status_match else "UNKNOWN"
+            category_match = re.search(r"^category\s*:\s*(.+)$", content, re.MULTILINE)
+            category = category_match.group(1).strip().strip('"').strip("'") if category_match else "unknown"
+        except Exception:
+            status = "UNKNOWN"
+            category = "unknown"
+
+        status_icon = "⏳" if "PENDING" in status else "📝"
+        print(f"  {status_icon} [{status}] {rel_path}")
+        print(f"       Category: {category} | Modified: {mtime}")
+        print()
+
+    print("  Untuk menyetujui proposal, Manusia di Control Room menjalankan:")
+    print("  team-orch knowledge approve <draft_id>")
+    print("=" * 70)
+
+
+def cmd_self_improve_escalate(args):
+    """Eskalasi signal ke Meta-Studio workflow (meta-agent-evolution)."""
+    print("=" * 70)
+    print(" 🚀 META-STUDIO: Self-Improvement — Escalation ke Capability Forge")
+    print("=" * 70)
+
+    signal_path = Path(getattr(args, "signal", str(SIGNALS_PATH)))
+    if not signal_path.exists():
+        print(f"[ERROR] signals.json tidak ditemukan: {signal_path}")
+        print("        Jalankan terlebih dahulu: meta-orch self-improve scan --project <id>")
+        sys.exit(1)
+
+    try:
+        signals = json.loads(signal_path.read_text())
+    except json.JSONDecodeError as e:
+        print(f"[ERROR] signals.json tidak valid: {e}")
+        sys.exit(1)
+
+    # Validasi bahwa signal memerlukan eskalasi ke meta-studio
+    requires_escalation = any(
+        sig.get("recommended_route") == "meta_studio_mcp"
+        for sig in signals.get("anomaly_signatures", [])
+    )
+
+    if not requires_escalation and not getattr(args, "force", False):
+        print("[INFO] signals.json tidak memerlukan eskalasi ke Meta-Studio.")
+        print("       (Tidak ada signature dengan route 'meta_studio_mcp')")
+        print("       Gunakan --force untuk memaksa eskalasi.")
+        sys.exit(0)
+
+    print(f"[ESCALATE] Signal dari project: {signals.get('project_id', 'unknown')}")
+    print(f"[ESCALATE] Anomaly score: {signals.get('anomaly_score', 'N/A')}")
+    print(f"[ESCALATE] Primary failure: {signals.get('friction_summary', {}).get('primary_failure_code', 'N/A')}")
+    print()
+    print("[ESCALATE] Memicu workflow: meta-agent-evolution.yaml")
+    print()
+
+    # Log escalation event
+    escalation_log = SELF_IMPROVE_DIR / "escalation-log.md"
+    timestamp = datetime.now(timezone.utc).isoformat()
+    log_entry = (
+        f"\n### Escalation Event — {timestamp}\n"
+        f"- **Project**: {signals.get('project_id', 'unknown')}\n"
+        f"- **Anomaly Score**: {signals.get('anomaly_score', 'N/A')}\n"
+        f"- **Trigger**: {signals.get('friction_summary', {}).get('primary_failure_code', 'N/A')}\n"
+        f"- **Next Step**: Workflow `meta-agent-evolution.yaml` → Stage `capability_discovery`\n"
+        f"- **Status**: PENDING_META_ARCHITECT_ANALYSIS\n"
+    )
+    with open(escalation_log, "a", encoding="utf-8") as f:
+        f.write(log_entry)
+
+    print("[NEXT STEPS] Instruksi untuk Meta-Architect:")
+    print("  1. Baca signals.json untuk memahami kebutuhan kapabilitas baru")
+    print("  2. Jalankan: team-orch init meta-<slug> --workflow meta-agent-evolution")
+    print("  3. Ikuti tahap capability_discovery → User Gate → architecture_design")
+    print()
+    print(f"[LOG] Escalation event dicatat ke: {escalation_log}")
+    print("=" * 70)
+
+
+def cmd_self_improve_diff(args):
+    """Tampilkan diff proposal draf terhadap versi produksi aktif."""
+    draft_id = getattr(args, "draft_id", None)
+    if not draft_id:
+        print("[ERROR] --draft-id diperlukan. Usage: meta-orch self-improve diff <draft_id>")
+        sys.exit(1)
+
+    # Cari file draf
+    draft_files = list(DRAFTS_DIR.glob(f"**/*{draft_id}*")) if DRAFTS_DIR.exists() else []
+    if not draft_files:
+        print(f"[ERROR] Draf '{draft_id}' tidak ditemukan di {DRAFTS_DIR}")
+        sys.exit(1)
+
+    draft_file = draft_files[0]
+    print(f"[DIFF] Draf: {draft_file}")
+
+    # Cari versi produksi (di topics/)
+    topic_id = draft_file.stem.split("-")[0] if "-" in draft_file.stem else draft_file.stem
+    production_candidates = list((AGENTS_DIR / "knowledge" / "topics").glob(f"*{topic_id}*"))
+
+    if not production_candidates:
+        print("[INFO] Tidak ada versi produksi yang cocok — ini adalah entitas baru (N/A).")
+        print("\n[DRAFT CONTENT]")
+        print(draft_file.read_text(encoding="utf-8", errors="replace"))
+        return
+
+    production_file = production_candidates[0]
+    result = subprocess.run(
+        ["diff", "-u", str(production_file), str(draft_file)],
+        capture_output=True, text=True,
+    )
+    print(result.stdout if result.stdout else "[NO DIFF] Konten identik dengan versi produksi.")
+
+
+def cmd_self_improve_rollback(args):
+    """Rollback knowledge/skill/role ke versi snapshot sebelumnya."""
+    topic_id = getattr(args, "topic_id", None)
+    version = getattr(args, "version", None)
+
+    if not topic_id:
+        print("[ERROR] topic_id diperlukan.")
+        print("Usage: meta-orch self-improve rollback <topic_id> --to-version <v>")
+        sys.exit(1)
+
+    # Human TTY Gate
+    if not sys.stdin.isatty():
+        print("[HUMAN_GATE] ❌ Rollback hanya dapat dieksekusi oleh Manusia di terminal interaktif.")
+        sys.exit(1)
+    if os.environ.get("HERDR_AUTOMATION_PANEL") == "1":
+        print("[HUMAN_GATE] ❌ Rollback diblok dalam mode otomasi agen.")
+        sys.exit(1)
+
+    snapshot_base = SNAPSHOTS_DIR / topic_id
+    if not snapshot_base.exists():
+        print(f"[ERROR] Tidak ada snapshot untuk topic '{topic_id}' di {snapshot_base}")
+        sys.exit(1)
+
+    if version:
+        snapshot_path = snapshot_base / version / "content.md"
+    else:
+        # Ambil versi terbaru
+        versions = sorted(snapshot_base.iterdir(), reverse=True)
+        if not versions:
+            print(f"[ERROR] Tidak ada snapshot version untuk topic '{topic_id}'")
+            sys.exit(1)
+        snapshot_path = versions[0] / "content.md"
+        version = versions[0].name
+
+    if not snapshot_path.exists():
+        print(f"[ERROR] Snapshot tidak ditemukan: {snapshot_path}")
+        sys.exit(1)
+
+    production_path = AGENTS_DIR / "knowledge" / "topics" / f"{topic_id}.md"
+
+    print(f"[ROLLBACK] Topic   : {topic_id}")
+    print(f"[ROLLBACK] Version : {version}")
+    print(f"[ROLLBACK] Dari    : {snapshot_path}")
+    print(f"[ROLLBACK] Ke      : {production_path}")
+    print()
+    confirm = input("⚠️  Konfirmasi rollback? (ketik 'yes' untuk melanjutkan): ")
+    if confirm.strip().lower() != "yes":
+        print("[ABORT] Rollback dibatalkan.")
+        sys.exit(0)
+
+    snapshot_content = snapshot_path.read_text(encoding="utf-8")
+    production_path.write_text(snapshot_content, encoding="utf-8")
+
+    # Log rollback
+    timestamp = datetime.now(timezone.utc).isoformat()
+    print(f"\n[ROLLBACK] ✓ Berhasil! {topic_id} dikembalikan ke versi {version}")
+    print(f"[LOG] Rollback event: {timestamp}")
+
+
+def cmd_self_improve_config(args):
+    """Baca atau perbarui konfigurasi threshold self-improvement."""
+    if not CONFIG_PATH.exists():
+        print(f"[ERROR] Config tidak ditemukan: {CONFIG_PATH}")
+        sys.exit(1)
+
+    set_value = getattr(args, "set_value", None)
+    if not set_value:
+        # Display current config
+        print("=" * 70)
+        print(" ⚙️  Self-Improvement Framework — Current Configuration")
+        print("=" * 70)
+        print(CONFIG_PATH.read_text(encoding="utf-8"))
+        print("=" * 70)
+        print(f"  Path: {CONFIG_PATH}")
+        print()
+        print("  Untuk memperbarui: meta-orch self-improve config --set thresholds.rejections_per_task=3")
+        return
+
+    # Parse key=value
+    if "=" not in set_value:
+        print(f"[ERROR] Format --set tidak valid: '{set_value}'. Gunakan: key=value")
+        sys.exit(1)
+
+    key, _, value = set_value.partition("=")
+    print(f"[CONFIG] Memperbarui: {key} = {value}")
+    print()
+    print("[WARNING] Modifikasi konfigurasi self-improvement hanya diperbolehkan oleh Manusia.")
+    print("          File ini akan diedit secara manual. Silakan update langsung di:")
+    print(f"          {CONFIG_PATH}")
+
+
+def cmd_self_improve(args):
+    """Dispatcher untuk sub-perintah meta-orch self-improve."""
+    sub = getattr(args, "si_command", None)
+    dispatch = {
+        "scan":     cmd_self_improve_scan,
+        "status":   cmd_self_improve_status,
+        "escalate": cmd_self_improve_escalate,
+        "diff":     cmd_self_improve_diff,
+        "rollback": cmd_self_improve_rollback,
+        "config":   cmd_self_improve_config,
+    }
+
+    if sub and sub in dispatch:
+        dispatch[sub](args)
+    else:
+        # Legacy behavior: backward-compatible dengan versi sebelumnya
+        print("=" * 70)
+        print(" 🔍 META-STUDIO: SIKLUS REFLEKSI & SELF-IMPROVEMENT FRAMEWORK")
+        print("=" * 70)
+        print(" Gunakan sub-perintah berikut:")
+        print("   meta-orch self-improve scan     --project <id>   # 0-token scanner")
+        print("   meta-orch self-improve status                     # pending proposals")
+        print("   meta-orch self-improve escalate --signal <path>  # eskalasi ke Meta-Studio")
+        print("   meta-orch self-improve diff <draft_id>           # lihat diff proposal")
+        print("   meta-orch self-improve rollback <id> --version v # rollback versi")
+        print("   meta-orch self-improve config [--set key=value]  # kelola threshold")
+
+        # Juga jalankan legacy diagnosis untuk backward compatibility
+        tasks_dir = AGENTS_DIR / "tasks"
+        audit_files = list(tasks_dir.glob("**/audit-trail.md"))
+        review_files = list(tasks_dir.glob("**/review-log.md"))
+        print(f"\n[📊 Ringkasan Cepat]")
+        print(f"  • Berkas audit-trail ditemukan: {len(audit_files)}")
+        print(f"  • Berkas review-log ditemukan  : {len(review_files)}")
+        print("=" * 70)
+
+
+# ===========================================================================
+# MAIN
+# ===========================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="meta-orch",
+        description="CLI Orchestrator untuk Meta-Studio & Self-Improvement Framework"
+    )
+    subparsers = parser.add_subparsers(dest="command")
+
+    # -- status --
+    subparsers.add_parser("status", help="Lihat status katalog peran, workflow, skill, dan MCP di Meta-Studio")
+
+    # -- self-improve --
+    p_improve = subparsers.add_parser(
+        "self-improve",
+        help="Self-Improvement Framework: scan, status, escalate, diff, rollback, config"
+    )
+    si_sub = p_improve.add_subparsers(dest="si_command")
+
+    # scan
+    p_scan = si_sub.add_parser("scan", help="Jalankan 0-token Signal Collector")
+    p_scan.add_argument("--project", "-p", required=True, help="Project ID yang dipindai")
+    p_scan.add_argument("--force", "-f", action="store_true", help="Override cooldown")
+    p_scan.add_argument("--verbose", "-v", action="store_true", help="Detail output")
+    p_scan.add_argument("--dry-run", action="store_true", help="Tanpa menulis signals.json")
+
+    # status
+    si_sub.add_parser("status", help="Tampilkan draf yang menunggu Human Approval")
+
+    # escalate
+    p_escalate = si_sub.add_parser("escalate", help="Eskalasi signal ke Meta-Studio Capability Forge")
+    p_escalate.add_argument("--signal", default=str(SIGNALS_PATH), help="Path ke signals.json")
+    p_escalate.add_argument("--force", "-f", action="store_true", help="Paksa eskalasi meski tidak ada meta_studio_mcp route")
+
+    # diff
+    p_diff = si_sub.add_parser("diff", help="Tampilkan diff proposal draf vs versi produksi")
+    p_diff.add_argument("draft_id", help="ID atau nama draf")
+
+    # rollback
+    p_rollback = si_sub.add_parser("rollback", help="Rollback topic ke versi snapshot (Requires TTY)")
+    p_rollback.add_argument("topic_id", help="Topic ID yang akan di-rollback")
+    p_rollback.add_argument("--version", "--to-version", dest="version", help="Versi snapshot target")
+
+    # config
+    p_config = si_sub.add_parser("config", help="Lihat atau perbarui konfigurasi threshold")
+    p_config.add_argument("--set", dest="set_value", metavar="KEY=VALUE", help="Set nilai konfigurasi")
+
+    args = parser.parse_args()
+
+    if args.command == "status":
+        cmd_status(args)
+    elif args.command == "self-improve":
+        cmd_self_improve(args)
+    else:
+        cmd_status(args)
+
+
+if __name__ == "__main__":
+    main()

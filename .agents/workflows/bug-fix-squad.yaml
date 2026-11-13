@@ -1,0 +1,45 @@
+workflow_id: "bug-fix-squad"
+name: "Hotfix & Bug Remediation Squad"
+description: "Alur terfokus untuk diagnosis dan perbaikan bug/incident: Analis (Root Cause Analysis) -> Coder (Patch & Regression Tests) -> Analis (Gatekeeper Verification)."
+version: "1.0.0"
+
+stages:
+  - id: "triage"
+    name: "Root Cause Analysis & Scope Diagnosis"
+    role: "analyst"
+    input_artifacts: []
+    output_artifacts:
+      - "01-requirements.md"
+      - "02-technical-spec.md"
+    gate:
+      type: "automatic"
+      required: false
+
+  - id: "patch"
+    name: "Code Patch & Regression Test Suite"
+    role: "coder"
+    input_artifacts:
+      - "02-technical-spec.md"
+    output_artifacts:
+      - "review-log.md"
+    gate:
+      type: "automatic"
+      required: false
+
+  - id: "verify"
+    name: "Remediation Verification & Quality Gate"
+    role: "analyst"
+    input_artifacts:
+      - "02-technical-spec.md"
+      - "review-log.md"
+    output_artifacts:
+      - "review-log.md"
+    gate:
+      type: "code_review"
+      required: true
+      on_reject:
+        loop_back_to: "patch"
+        max_retries: 3
+
+# 📌 STANDAR FRAMEWORK: Setelah seluruh tahap selesai, proyek masuk ke READY_FOR_SIGN_OFF.
+# Pengarsipan hanya dapat dilakukan oleh Pengguna di Control Room via: team-orch complete <project_id>

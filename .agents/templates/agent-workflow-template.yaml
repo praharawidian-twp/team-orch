@@ -1,0 +1,92 @@
+# ==============================================================================
+# 🔄 AGENT WORKFLOW BLUEPRINT TEMPLATE
+# ==============================================================================
+# File: .agents/workflows/<workflow_id>.yaml
+# Deskripsi: Definisi State Machine / DAG alur kerja perusahaan AI virtual.
+# ==============================================================================
+
+workflow_id: "custom-workflow"
+name: "Custom Engineering Workflow"
+description: "Alur kerja fleksibel yang memandu koordinasi multi-agen dari awal hingga tuntas."
+version: "1.0.0"
+
+# Daftar Tahapan Kerja Berurutan (Stages)
+stages:
+  - id: "stage-1-requirement"
+    name: "Penggalian Kebutuhan & Lingkup"
+    role: "project-manager"
+    input_artifacts: []
+    output_artifacts:
+      - "01-requirements.md"
+    gate:
+      type: "user_approval"          # user_approval | automatic | code_review
+      required: true
+      description: "Menunggu persetujuan tertulis dari pengguna sebelum masuk tahap teknis."
+
+  - id: "stage-2-architecture"
+    name: "Desain Arsitektur & Task Breakdown"
+    role: "analyst"
+    input_artifacts:
+      - "01-requirements.md"
+    output_artifacts:
+      - "02-technical-spec.md"
+      - "03-task-list.md"
+    gate:
+      type: "automatic"
+      required: false
+
+  - id: "stage-3-implementation"
+    name: "Implementasi Kode & Unit Test"
+    role: "coder"
+    input_artifacts:
+      - "02-technical-spec.md"
+      - "03-task-list.md"
+    output_artifacts:
+      - "src/"
+      - "tests/"
+      - "review-log.md"
+    gate:
+      type: "automatic"
+      required: false
+
+  - id: "stage-4-quality-review"
+    name: "Gatekeeper Code Review"
+    role: "analyst"
+    input_artifacts:
+      - "01-requirements.md"
+      - "02-technical-spec.md"
+      - "review-log.md"
+    output_artifacts:
+      - "review-log.md"
+    gate:
+      type: "code_review"
+      required: true
+      on_reject:
+        loop_back_to: "stage-3-implementation"
+        max_retries: 3
+        escalate_to: "project-manager"
+
+  - id: "stage-5-documentation"
+    name: "Penyusunan Dokumentasi"
+    role: "documenter"
+    input_artifacts:
+      - "01-requirements.md"
+      - "02-technical-spec.md"
+      - "review-log.md"
+    output_artifacts:
+      - "docs/README.md"
+    gate:
+      type: "automatic"
+      required: false
+
+# ==============================================================================
+# 📌 ATURAN STANDAR FRAMEWORK: GERBANG PERSETUJUAN AKHIR PENGGUNA (USER SIGN-OFF)
+# ==============================================================================
+# 1. Alur kerja (workflow) adalah prioritas utama penentu tahapan kerja tim otonom.
+# 2. Namun, seluruh workflow memiliki aturan baku framework:
+#    Setelah seluruh tahapan teknis di atas selesai (100%), proyek otomatis beralih
+#    ke status 'READY_FOR_SIGN_OFF' (Menunggu UAT Pengguna).
+# 3. Worker agen DILARANG menyelesaikan atau mengarsipkan proyek secara sepihak.
+# 4. Pengarsipan proyek hanya dapat dilakukan oleh Pengguna di Control Room melalui:
+#    👉 team-orch complete <project_id>
+# ==============================================================================

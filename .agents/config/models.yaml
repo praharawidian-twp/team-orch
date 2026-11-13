@@ -1,0 +1,76 @@
+# ==============================================================================
+# 🤖 MULTI-MODEL LLM MATRIX & PROVIDER CONFIGURATION
+# ==============================================================================
+# File: .agents/config/models.yaml
+# Memetakan peran agen ke model-model yang tersedia secara native di runtime Antigravity
+# ==============================================================================
+
+version: "1.0.0"
+active_profile: "${LLM_PROFILE:-hybrid}"
+
+# Daftar model resmi yang terverifikasi aktif di Antigravity runtime
+available_models:
+  - "Gemini 3.8 Flash (High)"
+  - "Gemini 3.8 Flash (Medium)"
+  - "Gemini 3.8 Flash (Low)"
+  - "Claude Sonnet 4.6 (Thinking)"
+  - "Claude Opus 4.6 (Thinking)"
+  - "GPT-OSS 120B (Medium)"
+
+# Standar 3-Tier Kompleksitas
+tiers:
+  high:
+    primary: "Claude Opus 4.6 (Thinking)"
+    fallback: "Gemini 3.8 Flash (High)"
+    effort: "high"
+    target_roles: ["analyst", "meta-architect", "agent-builder"]
+    description: "Deep reasoning, architecture decomposition, gatekeeper review, and security audit."
+
+  medium:
+    primary: "Claude Sonnet 4.6 (Thinking)"
+    fallback: "Gemini 3.8 Flash (Medium)"
+    alternative: "GPT-OSS 120B (Medium)"
+    effort: "medium"
+    target_roles: ["coder", "qa-engineer", "devops", "project-manager"]
+    description: "Modular feature implementation, unit testing, bug fixes, and environment orchestration."
+
+  low:
+    primary: "Gemini 3.8 Flash (Low)"
+    effort: "low"
+    target_roles: ["documenter"]
+    description: "Technical writing, documentation sync, formatting, and lightweight status tracking (90% token savings)."
+
+# Preset Profil Orkestrasi
+profiles:
+  hybrid:
+    description: "Profil Optimal: Claude untuk penalaran tinggi & coding presisi, GPT untuk QA, Gemini untuk dokumen & orkestrasi hemat kuota"
+    analyst: "Claude Opus 4.6 (Thinking)"
+    meta-architect: "Claude Opus 4.6 (Thinking)"
+    agent-builder: "Claude Sonnet 4.6 (Thinking)"
+    coder: "Claude Sonnet 4.6 (Thinking)"
+    qa-engineer: "GPT-OSS 120B (Medium)"
+    devops: "Gemini 3.8 Flash (Medium)"
+    project-manager: "Gemini 3.8 Flash (Medium)"
+    documenter: "Gemini 3.8 Flash (Low)"
+
+  all-gemini:
+    description: "Profil Hemat Kuota: Seluruh peran menggunakan keluarga Gemini Flash dengan adaptive reasoning effort"
+    analyst: "Gemini 3.8 Flash (High)"
+    meta-architect: "Gemini 3.8 Flash (High)"
+    agent-builder: "Gemini 3.8 Flash (High)"
+    coder: "Gemini 3.8 Flash (High)"
+    qa-engineer: "Gemini 3.8 Flash (Medium)"
+    devops: "Gemini 3.8 Flash (Medium)"
+    project-manager: "Gemini 3.8 Flash (Medium)"
+    documenter: "Gemini 3.8 Flash (Low)"
+
+  all-claude:
+    description: "Profil Penalaran Maksimal: Menggunakan Claude Opus & Sonnet untuk seluruh tahap rekayasa teknis"
+    analyst: "Claude Opus 4.6 (Thinking)"
+    meta-architect: "Claude Opus 4.6 (Thinking)"
+    agent-builder: "Claude Sonnet 4.6 (Thinking)"
+    coder: "Claude Sonnet 4.6 (Thinking)"
+    qa-engineer: "Claude Sonnet 4.6 (Thinking)"
+    devops: "Claude Sonnet 4.6 (Thinking)"
+    project-manager: "Claude Sonnet 4.6 (Thinking)"
+    documenter: "Gemini 3.8 Flash (Low)"

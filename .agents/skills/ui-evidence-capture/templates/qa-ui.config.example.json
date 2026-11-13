@@ -1,0 +1,19 @@
+{
+  "project_id": "example-service",
+  "allowed_origins": [
+    "https://example.internal"
+  ],
+  "login_url": "https://example.internal/login",
+  "post_login_selector": "",
+  "read_only": true,
+  "allow_mutation_paths": [],
+  "session_ttl_hours": 8,
+  "default_viewport": "1440x900",
+  "mask_selectors": [
+    "input[type=password]",
+    "[data-sensitive]"
+  ],
+  "backend_preference": "auto",
+  "credential_model": "human_session",
+  "evidence_root": "docs/qa/evidence"
+}

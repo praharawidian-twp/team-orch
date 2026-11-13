@@ -1,0 +1,34 @@
+# QA Target & Frontend Environment Registry Template
+# Standard registry for segregating Backend REST APIs and Frontend Web UIs.
+# Prevents AI agents from assuming/guessing frontend portal URLs.
+
+project_id: "<project_id>"
+updated_at: "YYYY-MM-DD"
+
+api_targets:
+  local_service:
+    base_url: "http://localhost:8080"
+    health_path: "/api/v1/health"
+    description: "Layanan backend lokal yang sedang diuji"
+  upstream_api:
+    base_url: "https://example-gateway.internal/rest/apigateway"
+    description: "Endpoint REST API upstream (Bukan Web UI)"
+
+ui_targets:
+  primary_web_portal:
+    status: "NEEDS_HUMAN_URL_CONFIRMATION" # Ubah ke ACTIVE setelah dikonfirmasi Manusia
+    base_url: "" # DILARANG DITEBAK AGEN. Wajib diisi/dikonfirmasi Manusia
+    login_url: ""
+    auth_required: true
+    expected_text_any:
+      - "Dashboard"
+      - "API"
+      - "Login"
+    forbidden_error_text:
+      - "Object Not Found"
+      - "404 Not Found"
+      - "502 Bad Gateway"
+      - "503 Service Unavailable"
+      - "Cannot GET"
+      - "This site can’t be reached"
+      - "ERR_NAME_NOT_RESOLVED"

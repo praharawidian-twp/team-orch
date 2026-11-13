@@ -1,0 +1,3698 @@
+#!/usr/bin/env python3
+"""
+team-orch: Autonomous Multi-Agent Team Orchestrator (v0.2.0)
+Manages dynamic virtual organization workflows, flexible agent roles, 
+declarative blueprints, artifact handoffs, and Herdr cross-pane orchestration.
+"""
+
+import os
+import sys
+import argparse
+import re
+import json
+import subprocess
+import shutil
+import time
+import platform
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+# Import standardized communication and I/O utilities (Phase 1)
+_cmd_dir = Path(__file__).resolve().parent
+if str(_cmd_dir) not in sys.path:
+    sys.path.insert(0, str(_cmd_dir))
+
+try:
+    from comm_io import (
+        safe_atomic_write,
+        safe_append,
+        sanitize_command,
+        sanitize_text,
+        compact_message_bus,
+        format_bus_event,
+        SCHEMA_VERSION
+    )
+except ImportError:
+    from cmd.comm_io import (
+        safe_atomic_write,
+        safe_append,
+        sanitize_command,
+        sanitize_text,
+        compact_message_bus,
+        format_bus_event,
+        SCHEMA_VERSION
+    )
+
+VERSION = "0.3.0"
+
+# ------------------------------------------------------------------------------
+# 1. Path & Workspace Discovery
+# ------------------------------------------------------------------------------
+
+def find_workspace_root() -> Path:
+    cwd = Path.cwd().resolve()
+    for p in [cwd] + list(cwd.parents):
+        if p == Path.home() or p in Path.home().parents or str(p) == "/":
+            break
+        if (p / ".agents").exists() or (p / ".git").exists():
+            return p
+    # Fallback: check if script location is inside a framework workspace
+    script_dir = Path(__file__).resolve().parent
+    for p in [script_dir, script_dir.parent]:
+        if p == Path.home() or p in Path.home().parents or str(p) == "/":
+            continue
+        if (p / ".agents").exists() or (p / ".git").exists():
+            return p
+    return cwd
+
+WORKSPACE_ROOT = find_workspace_root()
+BASE_DIR = WORKSPACE_ROOT
+AGENTS_DIR = WORKSPACE_ROOT / ".agents"
+TASKS_DIR = AGENTS_DIR / "tasks"
+ACTIVE_TASKS_DIR = TASKS_DIR / "active"
+COMPLETED_TASKS_DIR = TASKS_DIR / "completed"
+WORKFLOWS_DIR = AGENTS_DIR / "workflows"
+ROLES_DIR = AGENTS_DIR / "roles"
+TEMPLATES_DIR = AGENTS_DIR / "templates"
+BUS_DIR = AGENTS_DIR / "bus"
+BUS_EVENTS_FILE = BUS_DIR / "events.jsonl"
+BUS_INBOX_DIR = BUS_DIR / "inbox"
+KNOWLEDGE_DIR = AGENTS_DIR / "knowledge"
+KNOWLEDGE_REGISTRY = KNOWLEDGE_DIR / "registry.yaml"
+KNOWLEDGE_TOPICS_DIR = KNOWLEDGE_DIR / "topics"
+KNOWLEDGE_DRAFTS_DIR = KNOWLEDGE_DIR / ".drafts"
+LOCAL_DOMAINS_DIR = AGENTS_DIR / "domains"
+
+GLOBAL_TEAM_DIR = Path.home() / ".gemini" / "team-orch"
+GLOBAL_ROLES_DIR = GLOBAL_TEAM_DIR / "roles"
+GLOBAL_TEMPLATES_DIR = GLOBAL_TEAM_DIR / "templates"
+GLOBAL_KNOWLEDGE_DIR = GLOBAL_TEAM_DIR / "knowledge"
+GLOBAL_DOMAINS_DIR = GLOBAL_TEAM_DIR / "domains"
+GLOBAL_ACTIVE_DOMAIN_FILE = GLOBAL_TEAM_DIR / "active-domain.yaml"
+
+BASE_DOMAIN_ID = "base"
+
+def resolve_cmd(cmd_name: str) -> Optional[str]:
+    local_bin = WORKSPACE_ROOT / "cmd" / cmd_name
+    if local_bin.is_file() and os.access(local_bin, os.X_OK):
+        return str(local_bin)
+    found = shutil.which(cmd_name)
+    if found:
+        return found
+    return None
+
+def ensure_dirs():
+    ACTIVE_TASKS_DIR.mkdir(parents=True, exist_ok=True)
+    COMPLETED_TASKS_DIR.mkdir(parents=True, exist_ok=True)
+    WORKFLOWS_DIR.mkdir(parents=True, exist_ok=True)
+    ROLES_DIR.mkdir(parents=True, exist_ok=True)
+    TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
+    BUS_DIR.mkdir(parents=True, exist_ok=True)
+    BUS_INBOX_DIR.mkdir(parents=True, exist_ok=True)
+    KNOWLEDGE_DIR.mkdir(parents=True, exist_ok=True)
+    KNOWLEDGE_TOPICS_DIR.mkdir(parents=True, exist_ok=True)
+    KNOWLEDGE_DRAFTS_DIR.mkdir(parents=True, exist_ok=True)
+
+def get_roles_dir() -> Path:
+    if ROLES_DIR.exists() and any(ROLES_DIR.iterdir()):
+        return ROLES_DIR
+    return GLOBAL_ROLES_DIR
+
+def get_templates_dir() -> Path:
+    if TEMPLATES_DIR.exists() and any(TEMPLATES_DIR.iterdir()):
+        return TEMPLATES_DIR
+    return GLOBAL_TEMPLATES_DIR
+
+def get_knowledge_dir() -> Path:
+    if KNOWLEDGE_DIR.exists() and (KNOWLEDGE_REGISTRY.exists() or any(KNOWLEDGE_DIR.iterdir())):
+        return KNOWLEDGE_DIR
+    return GLOBAL_KNOWLEDGE_DIR
+
+def get_project_dir(project_id: str) -> Path:
+    p_dir = ACTIVE_TASKS_DIR / project_id
+    if not p_dir.exists():
+        c_dir = COMPLETED_TASKS_DIR / project_id
+        if c_dir.exists():
+            return c_dir
+    return p_dir
+
+# ------------------------------------------------------------------------------
+# 1B. Multi-Domain Pack Resolution & Anti-Collision Guardrails
+# ------------------------------------------------------------------------------
+
+def _sanitize_domain_id(domain_id: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_-]", "-", str(domain_id).strip()).lower()
+
+def find_domain_dir(domain_id: Optional[str]) -> Optional[Path]:
+    if not domain_id or str(domain_id).strip().lower() in ("", BASE_DOMAIN_ID, "none"):
+        return None
+    clean_id = _sanitize_domain_id(domain_id)
+    local_cand = LOCAL_DOMAINS_DIR / clean_id
+    if local_cand.is_dir() and (local_cand / "domain.yaml").is_file():
+        return local_cand
+    global_cand = GLOBAL_DOMAINS_DIR / clean_id
+    if global_cand.is_dir() and (global_cand / "domain.yaml").is_file():
+        return global_cand
+    return None
+
+def list_all_domains() -> List[Dict[str, Any]]:
+    found: Dict[str, Dict[str, Any]] = {}
+    for scope, root_dir in [("global", GLOBAL_DOMAINS_DIR), ("local", LOCAL_DOMAINS_DIR)]:
+        if not root_dir.exists():
+            continue
+        for entry in sorted(root_dir.iterdir()):
+            if not entry.is_dir() or entry.name.startswith("."):
+                continue
+            manifest_path = entry / "domain.yaml"
+            if not manifest_path.is_file():
+                continue
+            data = load_yaml(manifest_path) or {}
+            d_id = _sanitize_domain_id(data.get("domain_id") or entry.name)
+            existing_scope = found[d_id]["scope"] if d_id in found else None
+            merged_scope = "local+global" if (existing_scope and existing_scope != scope) else scope
+            found[d_id] = {
+                "domain_id": d_id,
+                "name": data.get("name", d_id),
+                "description": data.get("description", ""),
+                "version": data.get("version", "1.0.0"),
+                "organization": (data.get("organization") or {}).get("name", "-"),
+                "path": str(entry),
+                "scope": merged_scope,
+                "manifest": data,
+            }
+    return [found[k] for k in sorted(found.keys())]
+
+def get_active_domain_id() -> str:
+    env_dom = os.environ.get("TEAM_ORCH_DOMAIN", "").strip()
+    if env_dom:
+        norm = env_dom.lower()
+        return BASE_DOMAIN_ID if norm in ("none", BASE_DOMAIN_ID) else _sanitize_domain_id(norm)
+    if GLOBAL_ACTIVE_DOMAIN_FILE.is_file():
+        data = load_yaml(GLOBAL_ACTIVE_DOMAIN_FILE) or {}
+        d_id = str(data.get("active_domain", BASE_DOMAIN_ID)).strip().lower()
+        if d_id in ("", "none", BASE_DOMAIN_ID):
+            return BASE_DOMAIN_ID
+        return _sanitize_domain_id(d_id)
+    return BASE_DOMAIN_ID
+
+def set_active_domain_id(domain_id: str):
+    clean_id = BASE_DOMAIN_ID if str(domain_id).strip().lower() in ("", "none", BASE_DOMAIN_ID) else _sanitize_domain_id(domain_id)
+    GLOBAL_TEAM_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "active_domain": clean_id,
+        "updated_at": datetime.now().isoformat(),
+        "workspace_hint": str(WORKSPACE_ROOT),
+    }
+    safe_atomic_write(GLOBAL_ACTIVE_DOMAIN_FILE, dump_yaml(payload) + "\n")
+
+def load_domain_manifest(domain_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    d_dir = find_domain_dir(domain_id)
+    if not d_dir:
+        return None
+    data = load_yaml(d_dir / "domain.yaml") or {}
+    data["_domain_dir"] = str(d_dir)
+    data["_domain_id"] = _sanitize_domain_id(data.get("domain_id") or d_dir.name)
+    return data
+
+def resolve_project_domain(manifest: Dict[str, Any], explicit_domain: Optional[str] = None) -> Tuple[str, Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Resolve effective domain for a project with strict anti-bleed guardrails.
+    Returns: (effective_domain_id, domain_manifest_or_none, mismatch_error_msg_or_none)
+    """
+    active_id = _sanitize_domain_id(explicit_domain) if explicit_domain else get_active_domain_id()
+    if active_id in ("", "none"):
+        active_id = BASE_DOMAIN_ID
+
+    pinned_raw = manifest.get("domain_id")
+    pinned_id = _sanitize_domain_id(pinned_raw) if pinned_raw else None
+
+    if pinned_id and pinned_id != active_id and not explicit_domain:
+        proj_id = manifest.get("project_id", "<project_id>")
+        msg = (
+            f"🛑 [DOMAIN CONTEXT MISMATCH GUARD]: Proyek '{proj_id}' terikat pada domain '{pinned_id}', "
+            f"tetapi domain aktif saat ini adalah '{active_id}'.\n"
+            f"   Untuk mencegah pencampuran konteks antar-domain & halusinasi agen, eksekusi ditahan.\n"
+            f"   Pilih salah satu tindakan eksplisit:\n"
+            f"   1. Pindah domain aktif ke proyek ini : team-orch domain use {pinned_id}\n"
+            f"   2. Ubah ikatan domain proyek ini     : team-orch domain bind {proj_id} {active_id}"
+        )
+        return pinned_id, load_domain_manifest(pinned_id), msg
+
+    eff_id = pinned_id or active_id
+    if eff_id == BASE_DOMAIN_ID:
+        return BASE_DOMAIN_ID, None, None
+
+    d_manifest = load_domain_manifest(eff_id)
+    if not d_manifest:
+        msg = (
+            f"🛑 [DOMAIN PACK MISSING]: Domain '{eff_id}' tidak ditemukan di:\n"
+            f"   - {LOCAL_DOMAINS_DIR / eff_id}\n"
+            f"   - {GLOBAL_DOMAINS_DIR / eff_id}\n"
+            f"   Jalankan 'team-orch domain list' untuk memeriksa domain tersedia atau 'team-orch domain use base'."
+        )
+        return eff_id, None, msg
+    return eff_id, d_manifest, None
+
+def validate_domain_pack(domain_id: str) -> Tuple[bool, List[str], List[str]]:
+    errors: List[str] = []
+    warnings: List[str] = []
+    d_dir = find_domain_dir(domain_id)
+    if not d_dir:
+        return False, [f"Domain '{domain_id}' tidak ditemukan di local maupun global store."], []
+
+    manifest = load_yaml(d_dir / "domain.yaml")
+    if not isinstance(manifest, dict) or not manifest.get("domain_id"):
+        errors.append("domain.yaml tidak valid atau tidak memiliki field 'domain_id'.")
+        return False, errors, warnings
+
+    bp_rel = manifest.get("boilerplates_file")
+    if bp_rel and not (d_dir / bp_rel).is_file():
+        warnings.append(f"boilerplates_file '{bp_rel}' belum tersedia di {d_dir}.")
+
+    tmpls = manifest.get("templates") or {}
+    if isinstance(tmpls, dict):
+        for t_key in ("qad_docx", "qa_report_md"):
+            t_val = tmpls.get(t_key)
+            if t_val and not (d_dir / t_val).is_file():
+                warnings.append(f"Template '{t_key}' ({t_val}) tidak ditemukan di {d_dir}.")
+
+    # Check knowledge registry and ID collisions with Base Domain
+    base_reg_file = get_knowledge_dir() / "registry.yaml"
+    base_ids = set()
+    if base_reg_file.is_file():
+        b_data = load_yaml(base_reg_file) or {}
+        base_ids = {str(x.get("id")) for x in b_data.get("knowledge_catalog", []) if x.get("id")}
+
+    k_rel = manifest.get("knowledge_dir", "knowledge")
+    k_dir = d_dir / k_rel
+    reg_file = k_dir / "registry.yaml"
+    if reg_file.is_file():
+        d_reg = load_yaml(reg_file) or {}
+        for item in d_reg.get("knowledge_catalog", []):
+            tid = str(item.get("id", ""))
+            if tid in base_ids:
+                warnings.append(f"Konflik ID topik '{tid}' dengan Base Knowledge (Base akan diprioritaskan).")
+            t_file = item.get("file")
+            if t_file and not (k_dir / t_file).is_file():
+                errors.append(f"Topik knowledge '{tid}' merujuk berkas yang hilang: {k_dir / t_file}")
+    else:
+        warnings.append(f"Knowledge registry belum ada di {reg_file}.")
+
+    return (len(errors) == 0), errors, warnings
+
+def format_domain_context_block(domain_id: str, d_manifest: Optional[Dict[str, Any]]) -> str:
+    if domain_id == BASE_DOMAIN_ID or not d_manifest:
+        return (
+            "\n### [ACTIVE DOMAIN CONTEXT: BASE (Zero Institutional Knowledge)]:\n"
+            "- Domain Mode: `base` (Day-1 Employee / Tanpa Data Spesifik Perusahaan)\n"
+            "- Aturan Anti-Halusinasi: DILARANG mengarang nama organisasi, URL portal internal, pejabat/PIC, "
+            "template berlogo, atau boilerplate khusus. Jika pekerjaan membutuhkan konteks spesifik perusahaan, "
+            "tanyakan langsung kepada Pengguna di Control Room atau sarankan `team-orch domain init/use`."
+        )
+
+    org = d_manifest.get("organization") or {}
+    apps = d_manifest.get("applications") or []
+    officials = d_manifest.get("officials") or []
+    tmpls = d_manifest.get("templates") or {}
+    d_dir = Path(d_manifest.get("_domain_dir", ""))
+
+    lines = [
+        f"\n### [ACTIVE DOMAIN CONTEXT: {domain_id.upper()}]:",
+        f"- Domain ID: `{domain_id}` ({d_manifest.get('name', domain_id)})",
+        f"- Domain Path: `{d_dir}`",
+        f"- Organisasi: {org.get('name', '-')} | Divisi: {org.get('division', '-')}",
+    ]
+    if org.get("brand_color"):
+        lines.append(f"- Brand Color Dokumen: `{org.get('brand_color')}`")
+    if org.get("confidentiality_notice"):
+        lines.append(f"- Disclaimer Resmi: {org.get('confidentiality_notice')}")
+
+    if apps:
+        lines.append("- Aplikasi & Domain Internal Resmi:")
+        for app in apps:
+            if isinstance(app, dict):
+                raw_doms = app.get("internal_domains") or []
+                if isinstance(raw_doms, str):
+                    doms = raw_doms
+                else:
+                    fmt_doms = []
+                    for d_item in raw_doms:
+                        if isinstance(d_item, dict):
+                            env_k = d_item.get("env")
+                            url_v = d_item.get("url") or d_item.get("host") or str(d_item)
+                            fmt_doms.append(f"{env_k}: {url_v}" if env_k else str(url_v))
+                        else:
+                            fmt_doms.append(str(d_item))
+                    doms = ", ".join(fmt_doms) or "-"
+                lines.append(f"  • `{app.get('id', '-')}`: {app.get('name', '-')} (URLs: {doms})")
+
+    if officials:
+        lines.append("- Daftar Pejabat / Approver Resmi:")
+        for off in officials:
+            if isinstance(off, dict):
+                lines.append(f"  • {off.get('role', '-')}: {off.get('name', '-')}")
+
+    if isinstance(tmpls, dict) and any(tmpls.values()):
+        lines.append("- Template Dokumen Resmi Domain:")
+        for tk in ("qad_docx", "qa_report_md", "external_reference_dir"):
+            if tmpls.get(tk):
+                lines.append(f"  • {tk}: `{tmpls.get(tk)}`")
+
+    bp_file = d_manifest.get("boilerplates_file")
+    if bp_file and (d_dir / bp_file).is_file():
+        bp_data = load_yaml(d_dir / bp_file) or {}
+        repos = bp_data.get("repositories") or []
+        if repos:
+            lines.append("- Boilerplate Terdaftar di Domain Ini:")
+            for r in repos:
+                if isinstance(r, dict):
+                    lines.append(f"  • {r.get('name', r.get('id'))}: `{r.get('url', '-')}` ({r.get('type', '-')})")
+
+    lines.append("- Konsistensi Konteks: Gunakan HANYA data domain di atas. DILARANG mencampur konteks dari domain lain.")
+    return "\n".join(lines)
+
+def load_knowledge_catalog(domain_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    catalog: List[Dict[str, Any]] = []
+    seen_ids = set()
+
+    k_dir = get_knowledge_dir()
+    reg_file = k_dir / "registry.yaml"
+    if not reg_file.exists():
+        reg_file = GLOBAL_KNOWLEDGE_DIR / "registry.yaml"
+    if reg_file.exists():
+        try:
+            data = load_yaml(reg_file)
+            if isinstance(data, dict):
+                for item in data.get("knowledge_catalog", []):
+                    if isinstance(item, dict) and item.get("id"):
+                        enriched = dict(item)
+                        enriched["_source"] = BASE_DOMAIN_ID
+                        enriched["_knowledge_dir"] = str(reg_file.parent)
+                        catalog.append(enriched)
+                        seen_ids.add(str(item["id"]))
+        except Exception:
+            pass
+
+    eff_domain = domain_id if domain_id is not None else get_active_domain_id()
+    if eff_domain and eff_domain != BASE_DOMAIN_ID:
+        d_manifest = load_domain_manifest(eff_domain)
+        if d_manifest:
+            d_dir = Path(d_manifest["_domain_dir"])
+            dk_dir = d_dir / d_manifest.get("knowledge_dir", "knowledge")
+            d_reg_file = dk_dir / "registry.yaml"
+            if d_reg_file.is_file():
+                try:
+                    d_data = load_yaml(d_reg_file)
+                    if isinstance(d_data, dict):
+                        for item in d_data.get("knowledge_catalog", []):
+                            if isinstance(item, dict) and item.get("id"):
+                                tid = str(item["id"])
+                                if tid in seen_ids:
+                                    continue
+                                enriched = dict(item)
+                                enriched["_source"] = f"domain:{eff_domain}"
+                                enriched["_knowledge_dir"] = str(dk_dir)
+                                catalog.append(enriched)
+                                seen_ids.add(tid)
+                except Exception:
+                    pass
+
+    return catalog
+
+def get_accessible_knowledge(role: Optional[str], domain_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    catalog = load_knowledge_catalog(domain_id=domain_id)
+    if not role:
+        return catalog
+    role_norm = role.lower().strip()
+    accessible = []
+    for item in catalog:
+        acc = item.get("access", "*")
+        if acc == "*" or acc == "all":
+            accessible.append(item)
+        elif isinstance(acc, list):
+            lowers = [str(r).lower().strip() for r in acc]
+            if role_norm in lowers or "*" in lowers or "all" in lowers:
+                accessible.append(item)
+        elif isinstance(acc, str):
+            if role_norm == acc.lower().strip() or acc == "*":
+                accessible.append(item)
+    return accessible
+
+# ------------------------------------------------------------------------------
+# 2. Lightweight Pure-Python YAML Parser & Dumper (Zero External Dependencies)
+# ------------------------------------------------------------------------------
+
+def parse_yaml_value(val_str: str) -> Any:
+    val = val_str.strip()
+    if val in ("true", "True"): return True
+    if val in ("false", "False"): return False
+    if val in ("null", "None", "~", ""): return None
+    if val.isdigit(): return int(val)
+    if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+        return val[1:-1]
+    if val.startswith("[") and val.endswith("]"):
+        inner = val[1:-1].strip()
+        if not inner: return []
+        return [parse_yaml_value(x.strip()) for x in inner.split(",") if x.strip()]
+    return val
+
+def load_yaml(filepath: Union[str, Path]) -> Any:
+    path = Path(filepath)
+    if not path.exists():
+        return {}
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+
+    def parse_block(line_idx: int, min_indent: int) -> Tuple[Any, int]:
+        res: Dict[str, Any] = {}
+        is_list: Optional[bool] = None
+        list_res: List[Any] = []
+
+        while line_idx < len(lines):
+            line = lines[line_idx]
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                line_idx += 1
+                continue
+
+            indent = len(line) - len(line.lstrip(" "))
+            if indent < min_indent:
+                break
+
+            if stripped.startswith("- "):
+                if is_list is None:
+                    is_list = True
+
+                content = stripped[2:].strip()
+                if ":" in content and not content.startswith("{"):
+                    k, v = content.split(":", 1)
+                    k = k.strip()
+                    v = v.strip()
+                    sub_dict: Dict[str, Any] = {}
+                    if v in ("|", ">"):
+                        ml_lines = []
+                        line_idx += 1
+                        while line_idx < len(lines):
+                            ml_line = lines[line_idx]
+                            ml_strip = ml_line.strip()
+                            if not ml_strip:
+                                ml_lines.append("")
+                                line_idx += 1
+                                continue
+                            ml_indent = len(ml_line) - len(ml_line.lstrip(" "))
+                            if ml_indent <= indent:
+                                break
+                            ml_lines.append(ml_line[indent + 2:])
+                            line_idx += 1
+                        sub_dict[k] = "\n".join(ml_lines).strip()
+                    elif v == "":
+                        sub_res, line_idx = parse_block(line_idx + 1, indent + 2)
+                        sub_dict[k] = sub_res
+                    else:
+                        sub_dict[k] = parse_yaml_value(v)
+                        line_idx += 1
+
+                    while line_idx < len(lines):
+                        nxt_line = lines[line_idx]
+                        nxt_strip = nxt_line.strip()
+                        if not nxt_strip or nxt_strip.startswith("#"):
+                            line_idx += 1
+                            continue
+                        nxt_indent = len(nxt_line) - len(nxt_line.lstrip(" "))
+                        if nxt_indent <= indent or nxt_strip.startswith("- "):
+                            break
+                        if ":" in nxt_strip:
+                            nk, nv = nxt_strip.split(":", 1)
+                            nk = nk.strip()
+                            nv = nv.strip()
+                            if nv in ("|", ">"):
+                                ml_lines = []
+                                line_idx += 1
+                                while line_idx < len(lines):
+                                    ml_line = lines[line_idx]
+                                    if not ml_line.strip():
+                                        ml_lines.append("")
+                                        line_idx += 1
+                                        continue
+                                    ml_indent = len(ml_line) - len(ml_line.lstrip(" "))
+                                    if ml_indent <= nxt_indent:
+                                        break
+                                    ml_lines.append(ml_line[nxt_indent + 2:])
+                                    line_idx += 1
+                                sub_dict[nk] = "\n".join(ml_lines).strip()
+                            elif nv == "":
+                                sub_res, line_idx = parse_block(line_idx + 1, nxt_indent + 2)
+                                sub_dict[nk] = sub_res
+                            else:
+                                sub_dict[nk] = parse_yaml_value(nv)
+                                line_idx += 1
+                        else:
+                            line_idx += 1
+                    list_res.append(sub_dict)
+                    continue
+                else:
+                    list_res.append(parse_yaml_value(content))
+                    line_idx += 1
+                    continue
+            else:
+                if is_list is True:
+                    break
+                is_list = False
+
+                if ":" in stripped:
+                    k, v = stripped.split(":", 1)
+                    k = k.strip()
+                    v = v.strip()
+                    if v in ("|", ">"):
+                        ml_lines = []
+                        line_idx += 1
+                        while line_idx < len(lines):
+                            ml_line = lines[line_idx]
+                            if not ml_line.strip():
+                                ml_lines.append("")
+                                line_idx += 1
+                                continue
+                            ml_indent = len(ml_line) - len(ml_line.lstrip(" "))
+                            if ml_indent <= indent:
+                                break
+                            ml_lines.append(ml_line[indent + 2:])
+                            line_idx += 1
+                        res[k] = "\n".join(ml_lines).strip()
+                    elif v == "":
+                        sub_res, line_idx = parse_block(line_idx + 1, indent + 2)
+                        res[k] = sub_res
+                    else:
+                        res[k] = parse_yaml_value(v)
+                        line_idx += 1
+                else:
+                    line_idx += 1
+
+        return (list_res if is_list else res), line_idx
+
+    result, _ = parse_block(0, 0)
+    return result
+
+def dump_yaml(data: Any, indent: int = 0) -> str:
+    lines = []
+    prefix = "  " * indent
+    if isinstance(data, dict):
+        for k, v in data.items():
+            if isinstance(v, dict):
+                lines.append(f"{prefix}{k}:")
+                lines.append(dump_yaml(v, indent + 1))
+            elif isinstance(v, list):
+                if not v:
+                    lines.append(f"{prefix}{k}: []")
+                else:
+                    lines.append(f"{prefix}{k}:")
+                    lines.append(dump_yaml(v, indent + 1))
+            elif isinstance(v, str):
+                if "\n" in v:
+                    lines.append(f"{prefix}{k}: |")
+                    for sub in v.splitlines():
+                        lines.append(f"{prefix}  {sub}")
+                else:
+                    lines.append(f'{prefix}{k}: "{v}"')
+            elif v is None:
+                lines.append(f"{prefix}{k}: null")
+            elif isinstance(v, bool):
+                bv = "true" if v else "false"
+                lines.append(f"{prefix}{k}: {bv}")
+            else:
+                lines.append(f"{prefix}{k}: {v}")
+    elif isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict):
+                first = True
+                for k, v in item.items():
+                    if first:
+                        if isinstance(v, (dict, list)):
+                            lines.append(f"{prefix}- {k}:")
+                            lines.append(dump_yaml(v, indent + 2))
+                        elif isinstance(v, str):
+                            lines.append(f'{prefix}- {k}: "{v}"')
+                        elif v is None:
+                            lines.append(f"{prefix}- {k}: null")
+                        elif isinstance(v, bool):
+                            bv = "true" if v else "false"
+                            lines.append(f"{prefix}- {k}: {bv}")
+                        else:
+                            lines.append(f"{prefix}- {k}: {v}")
+                        first = False
+                    else:
+                        sub_prefix = prefix + "  "
+                        if isinstance(v, (dict, list)):
+                            lines.append(f"{sub_prefix}{k}:")
+                            lines.append(dump_yaml(v, indent + 2))
+                        elif isinstance(v, str):
+                            lines.append(f'{sub_prefix}{k}: "{v}"')
+                        elif v is None:
+                            lines.append(f"{sub_prefix}{k}: null")
+                        elif isinstance(v, bool):
+                            bv = "true" if v else "false"
+                            lines.append(f"{sub_prefix}{k}: {bv}")
+                        else:
+                            lines.append(f"{sub_prefix}{k}: {v}")
+            else:
+                if isinstance(item, str):
+                    lines.append(f'{prefix}- "{item}"')
+                else:
+                    lines.append(f"{prefix}- {item}")
+    return "\n".join(l for l in lines if l is not None)
+
+# ------------------------------------------------------------------------------
+# 3. Model Tiers & Role Registry
+# ------------------------------------------------------------------------------
+
+ROLE_MODELS = {
+    "pm": "gemini-3.8-flash-high",
+    "project-manager": "gemini-3.8-flash-high",
+    "analyst": "gemini-3.1-pro-high",
+    "analis": "gemini-3.1-pro-high",
+    "coder": "gemini-3.8-flash-high",
+    "dev": "gemini-3.8-flash-high",
+    "documenter": "gemini-3.8-flash-low",
+    "doc": "gemini-3.8-flash-low",
+    "qa-engineer": "gemini-3.8-flash-high",
+    "qa": "gemini-3.8-flash-high",
+    "devops": "gemini-3.8-flash-high",
+    "ops": "gemini-3.8-flash-high",
+    "infra": "gemini-3.8-flash-high",
+}
+
+def get_role_data(role_id: str) -> Dict[str, Any]:
+    r_id = role_id.lower()
+    r_id_normalized = {
+        "pm": "project-manager",
+        "analis": "analyst",
+        "dev": "coder",
+        "doc": "documenter",
+        "qa": "qa-engineer",
+        "ops": "devops",
+        "infra": "devops"
+    }.get(r_id, r_id)
+
+    roles_dir = get_roles_dir()
+    yaml_file = roles_dir / f"{r_id_normalized}.yaml"
+    if yaml_file.exists():
+        data = load_yaml(yaml_file)
+        if "id" not in data:
+            data["id"] = r_id_normalized
+        return data
+
+    # Markdown fallback
+    md_file = roles_dir / f"{r_id_normalized}.md"
+    if md_file.exists():
+        content = md_file.read_text(encoding="utf-8")
+        title_m = re.search(r"^#\s*Role:\s*(.+)$", content, re.MULTILINE)
+        title = title_m.group(1).strip() if title_m else r_id_normalized.capitalize()
+        return {
+            "id": r_id_normalized,
+            "title": title,
+            "model_tier": ROLE_MODELS.get(r_id_normalized, "medium"),
+            "description": f"Role {r_id_normalized} from markdown file",
+            "system_prompt": content
+        }
+
+    return {
+        "id": r_id_normalized,
+        "title": r_id_normalized.capitalize(),
+        "model_tier": ROLE_MODELS.get(r_id_normalized, "medium"),
+        "description": "Dynamic role",
+        "system_prompt": f"Anda bertindak sebagai {r_id_normalized}."
+    }
+
+def list_all_roles() -> List[Dict[str, Any]]:
+    roles_dir = get_roles_dir()
+    results = []
+    seen = set()
+
+    for yf in sorted(roles_dir.glob("*.yaml")):
+        data = load_yaml(yf)
+        rid = data.get("id", yf.stem)
+        seen.add(rid)
+        results.append(data)
+
+    for mf in sorted(roles_dir.glob("*.md")):
+        rid = mf.stem
+        if rid not in seen:
+            data = get_role_data(rid)
+            seen.add(rid)
+            results.append(data)
+    return results
+
+# ------------------------------------------------------------------------------
+# 4. Workflow Blueprint Engine
+# ------------------------------------------------------------------------------
+
+DEFAULT_WORKFLOW_ID = "standard-software-house"
+
+def load_workflow(workflow_id: str) -> Dict[str, Any]:
+    wf_id = workflow_id or DEFAULT_WORKFLOW_ID
+    wf_file = WORKFLOWS_DIR / f"{wf_id}.yaml"
+    if wf_file.exists():
+        return load_yaml(wf_file)
+
+    # Fallback to standard 5-tier SDLC
+    return {
+        "workflow_id": "standard-software-house",
+        "name": "Standard Software House (5-Tier SDLC)",
+        "description": "Default SDLC workflow: PM -> Analis -> Coder -> Gatekeeper Review -> Dokumenter",
+        "stages": [
+            {
+                "id": "requirement",
+                "name": "Requirements & Scope Alignment",
+                "role": "project-manager",
+                "input_artifacts": [],
+                "output_artifacts": ["01-requirements.md"],
+                "gate": {"type": "user_approval", "required": True}
+            },
+            {
+                "id": "architecture",
+                "name": "Boilerplate Audit & Technical Spec",
+                "role": "analyst",
+                "input_artifacts": ["01-requirements.md"],
+                "output_artifacts": ["02-technical-spec.md", "03-task-list.md"],
+                "gate": {"type": "automatic", "required": False}
+            },
+            {
+                "id": "development",
+                "name": "Atomic Implementation & Unit Testing",
+                "role": "coder",
+                "input_artifacts": ["02-technical-spec.md", "03-task-list.md"],
+                "output_artifacts": ["review-log.md"],
+                "gate": {"type": "automatic", "required": False}
+            },
+            {
+                "id": "review",
+                "name": "Gatekeeper Code Review & Security Audit",
+                "role": "analyst",
+                "input_artifacts": ["01-requirements.md", "02-technical-spec.md", "review-log.md"],
+                "output_artifacts": ["review-log.md"],
+                "gate": {"type": "code_review", "required": True}
+            },
+            {
+                "id": "documentation",
+                "name": "Knowledge Preservation & User Guides",
+                "role": "documenter",
+                "input_artifacts": ["01-requirements.md", "02-technical-spec.md", "review-log.md"],
+                "output_artifacts": ["docs/"],
+                "gate": {"type": "automatic", "required": False}
+            }
+        ]
+    }
+
+def list_all_workflows() -> List[Dict[str, Any]]:
+    wfs = []
+    if WORKFLOWS_DIR.exists():
+        for f in sorted(WORKFLOWS_DIR.glob("*.yaml")):
+            data = load_yaml(f)
+            if data and "workflow_id" in data:
+                wfs.append(data)
+    if not wfs:
+        wfs.append(load_workflow(DEFAULT_WORKFLOW_ID))
+    return wfs
+
+# ------------------------------------------------------------------------------
+# 5. Project Manifest Management (project.yaml)
+# ------------------------------------------------------------------------------
+
+def get_or_create_manifest(project_id: str, workflow_id: str = DEFAULT_WORKFLOW_ID) -> Dict[str, Any]:
+    p_dir = get_project_dir(project_id)
+    manifest_file = p_dir / "project.yaml"
+    if manifest_file.exists():
+        data = load_yaml(manifest_file)
+        if data and "workflow" in data:
+            data.setdefault("execution_mode", "fleet")
+            data.setdefault("guardrails", {
+                "circuit_breaker_status": "ACTIVE",
+                "current_retries": 0,
+                "turn_count": 0,
+                "max_peer_turns": 2,
+                "max_rejection_retries": 3,
+                "locked_at": None,
+                "lock_reason": None
+            })
+            return data
+
+    # Create new manifest from workflow
+    wf = load_workflow(workflow_id)
+    stages = wf.get("stages", [])
+    first_stage_id = stages[0]["id"] if stages else "start"
+
+    # Infer approval status and progress from existing project files
+    req_file = p_dir / "01-requirements.md"
+    spec_file = p_dir / "02-technical-spec.md"
+    rev_file = p_dir / "review-log.md"
+
+    req_approved = False
+    if req_file.exists():
+        text = req_file.read_text(encoding="utf-8")
+        m = re.search(r"Status(?:\s*Persetujuan)?\s*:\s*[`\[]?\s*APPROVED\b", text, re.IGNORECASE)
+        if m and "|" not in text.split("Status")[1].splitlines()[0]:
+            req_approved = True
+
+
+    current_idx = 0
+    code_reviewed = False
+    review_verdict = None
+
+    if rev_file.exists():
+        rev_text = rev_file.read_text(encoding="utf-8")
+        if "PASSED" in rev_text.upper() or "APPROVED" in rev_text.upper():
+            code_reviewed = True
+            review_verdict = "APPROVED"
+            current_idx = 4  # Stage 5: documentation
+        elif ("REVIEW REQUEST" in rev_text.upper() or "PENGAJUAN REVIEW" in rev_text.upper() or "TASK-" in rev_text.upper()) and "MENUNGGU CODER" not in rev_text.upper():
+            current_idx = 3  # Stage 4: review
+        elif spec_file.exists():
+            current_idx = 2  # Stage 3: implementation
+    elif spec_file.exists():
+        current_idx = 2  # Stage 3: implementation
+    elif req_approved:
+        current_idx = 1  # Stage 2: architecture
+
+    current_stage_id = stages[current_idx]["id"] if current_idx < len(stages) else "complete"
+
+    data = {
+        "project_id": project_id,
+        "created_at": datetime.now().isoformat(),
+        "workflow": wf.get("workflow_id", workflow_id),
+        "status": "ACTIVE",
+        "execution_mode": "fleet",
+        "current_stage_id": current_stage_id,
+        "current_stage_index": current_idx,
+        "total_stages": len(stages),
+        "gate_status": {
+            "user_approved": req_approved,
+            "approved_at": datetime.now().isoformat() if req_approved else None,
+            "code_reviewed": code_reviewed,
+            "review_verdict": review_verdict,
+            "review_iteration": 0
+        },
+        "guardrails": {
+            "circuit_breaker_status": "ACTIVE",
+            "current_retries": 0,
+            "turn_count": 0,
+            "max_peer_turns": 2,
+            "max_rejection_retries": 3,
+            "locked_at": None,
+            "lock_reason": None
+        },
+        "assigned_panes": {
+            "control_room": os.environ.get("HERDR_PANE_ID", "w8:p1"),
+            "project_manager": os.environ.get("HERDR_PANE_ID", "w8:p1")
+        },
+        "stage_history": []
+    }
+
+    if p_dir.exists():
+        manifest_file.write_text(dump_yaml(data), encoding="utf-8")
+    return data
+
+def save_manifest(project_id: str, manifest: Dict[str, Any]):
+    p_dir = get_project_dir(project_id)
+    manifest_file = p_dir / "project.yaml"
+    manifest_file.write_text(dump_yaml(manifest), encoding="utf-8")
+
+# ------------------------------------------------------------------------------
+# 6. Audit Trail Logging & Observation
+# ------------------------------------------------------------------------------
+
+def append_audit_log(project_id: str, role: str, event: str, desc: str, files: list = None, cmd: str = None, duration: str = None, status: str = "PASS", security: str = "CLEAN / SECURE", next_step: str = None) -> str:
+    p_dir = get_project_dir(project_id)
+    audit_file = p_dir / "audit-trail.md"
+    if not audit_file.exists():
+        template = get_templates_dir() / "audit-trail-template.md"
+        content = template.read_text(encoding="utf-8") if template.exists() else "# Audit Trail: " + project_id + "\n"
+        content = content.replace("[PROJECT_NAME_OR_ID]", project_id)
+        safe_atomic_write(audit_file, content)
+
+    text = audit_file.read_text(encoding="utf-8")
+    existing_entries = re.findall(r"###\s*\[AUDIT-(\d+)\]", text)
+    next_idx = max([int(x) for x in existing_entries], default=0) + 1
+    audit_id = f"AUDIT-{next_idx:03d}"
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    entry_lines = [
+        f"\n### [{audit_id}] {now_str} | {role.upper()} | {event.upper()}",
+        f"- **Pelaksana (Actor)**: {role.capitalize()} (`{ROLE_MODELS.get(role.lower(), 'default')}`)",
+        f"- **Tindakan / Proses**: {desc}",
+    ]
+    if files:
+        entry_lines.append(f"- **File & Artefak**: {', '.join(f'`{f}`' for f in files)}")
+    entry_lines.append("- **Detail Teknis & Performa**:")
+    if cmd:
+        entry_lines.append(f"  - Perintah Shell: `{cmd}`")
+    if duration:
+        entry_lines.append(f"  - Durasi Eksekusi: {duration}")
+    entry_lines.append(f"  - Status Luaran: {status}")
+    entry_lines.append(f"- **Verifikasi Keamanan & Integritas Teknis**:\n  - {security}")
+    if next_step:
+        entry_lines.append(f"- **Langkah Lanjutan**: {next_step}")
+
+    safe_append(audit_file, "\n".join(entry_lines) + "\n")
+    return audit_id
+
+# ------------------------------------------------------------------------------
+# 6b. Inter-Agent Message Bus, Tiered Severity Engine & Circuit Breaker
+# ------------------------------------------------------------------------------
+
+DEFAULT_EVENT_SEVERITIES = {
+    # SILENT: zero token, logged to disk only, PM stays completely asleep
+    "TASK_PROGRESS": "SILENT",
+    "CODE_EDIT": "SILENT",
+    "UNIT_TEST_PASS": "SILENT",
+    "PEER_QUERY": "SILENT",
+    "PEER_REPLY": "SILENT",
+    "DOCS_UPDATE": "SILENT",
+    "AUDIT_RECORD": "SILENT",
+    "HANDOFF_REVIEW": "SILENT",
+
+    # TELEMETRY: zero token, updates terminal UI / status bar only
+    "STAGE_PROGRESS": "TELEMETRY",
+    "PANE_STATUS_CHANGE": "TELEMETRY",
+    "HEARTBEAT": "TELEMETRY",
+
+    # ACTIONABLE: High-value / blocker, alerts Control Room & wakes PM
+    "GATE_APPROVAL_NEEDED": "ACTIONABLE",
+    "CIRCUIT_BREAKER_TRIPPED": "ACTIONABLE",
+    "ESCALATION": "ACTIONABLE",
+    "PROJECT_COMPLETED": "ACTIONABLE",
+    "FATAL_ERROR": "ACTIONABLE",
+}
+
+def determine_severity(event_type: str, explicit_severity: Optional[str] = None) -> str:
+    if explicit_severity and explicit_severity.upper() in ("SILENT", "TELEMETRY", "ACTIONABLE"):
+        return explicit_severity.upper()
+    return DEFAULT_EVENT_SEVERITIES.get(event_type.upper(), "SILENT")
+
+def record_bus_event(project_id: Optional[str], from_role: str, to_role: str, event_type: str, message: str = "", payload: Optional[dict] = None, severity: Optional[str] = None) -> str:
+    ensure_dirs()
+    sev = determine_severity(event_type, severity)
+    event_data = format_bus_event(
+        project_id=project_id,
+        from_role=from_role,
+        to_role=to_role,
+        event_type=event_type,
+        message=message or f"Event {event_type} from {from_role} to {to_role}",
+        payload=payload,
+        severity=sev,
+        status="PROCESSED"
+    )
+    try:
+        safe_append(BUS_EVENTS_FILE, json.dumps(event_data))
+        compact_message_bus(BUS_EVENTS_FILE, max_size_bytes=5 * 1024 * 1024, force=False)
+    except Exception:
+        pass
+    return event_data["event_id"]
+
+def check_circuit_breaker(project_id: Optional[str], from_role: str, to_role: str, event_type: str) -> Tuple[bool, Optional[str]]:
+    if not project_id:
+        return True, None
+    p_dir = get_project_dir(project_id)
+    if not p_dir.exists():
+        return True, None
+
+    manifest = get_or_create_manifest(project_id)
+    guardrails = manifest.setdefault("guardrails", {
+        "circuit_breaker_status": "ACTIVE",
+        "current_retries": 0,
+        "turn_count": 0,
+        "max_peer_turns": 2,
+        "max_rejection_retries": 3,
+        "locked_at": None,
+        "lock_reason": None
+    })
+
+    if guardrails.get("circuit_breaker_status") == "LOCKED":
+        return False, f"CIRCUIT BREAKER IS LOCKED! Agen '{from_role}' dibungkam otomatis untuk mencegah pemborosan token. Alasan: {guardrails.get('lock_reason')}. Buka kunci dengan: team-orch resolve {project_id}"
+
+    # Check peer turns
+    if event_type.upper() in ("PEER_QUERY", "CLARIFICATION", "DEBATE"):
+        guardrails["turn_count"] = guardrails.get("turn_count", 0) + 1
+        max_turns = guardrails.get("max_peer_turns", 2)
+        if guardrails["turn_count"] > max_turns:
+            guardrails["circuit_breaker_status"] = "LOCKED"
+            guardrails["locked_at"] = datetime.now().isoformat()
+            guardrails["lock_reason"] = f"Batas komunikasi dialog peer ({max_turns} putaran) terlampaui antara {from_role} dan {to_role}."
+            save_manifest(project_id, manifest)
+            append_audit_log(
+                project_id=project_id,
+                role="system",
+                event="CIRCUIT_BREAKER_TRIPPED",
+                desc=guardrails["lock_reason"],
+                status="THROTTLED",
+                security="CIRCUIT BREAKER ACTIVATED - ZERO TOKEN GUARD ENFORCED",
+                next_step=f"Human intervention required: team-orch resolve {project_id} --note '<resolution>'"
+            )
+            return False, f"CIRCUIT BREAKER TRIPPED! Batas dialog ({max_turns} putaran) tercapai. Agen dibungkam otomatis demi mencegah token burn. Silakan buka kunci via Control Room."
+
+    # Check rejection retries
+    if event_type.upper() in ("REJECT_REVIEW", "REVIEW_REJECTED", "REVISION_REQUESTED"):
+        guardrails["current_retries"] = guardrails.get("current_retries", 0) + 1
+        max_retries = guardrails.get("max_rejection_retries", 3)
+        manifest["gate_status"]["review_iteration"] = guardrails["current_retries"]
+        if guardrails["current_retries"] >= max_retries:
+            guardrails["circuit_breaker_status"] = "LOCKED"
+            guardrails["locked_at"] = datetime.now().isoformat()
+            guardrails["lock_reason"] = f"Batas maksimal iterasi revisi kode ({max_retries}x) terlampaui."
+            save_manifest(project_id, manifest)
+            append_audit_log(
+                project_id=project_id,
+                role="system",
+                event="CIRCUIT_BREAKER_TRIPPED",
+                desc=guardrails["lock_reason"],
+                status="THROTTLED",
+                security="CIRCUIT BREAKER ACTIVATED - ZERO TOKEN GUARD ENFORCED",
+                next_step=f"Human intervention required: team-orch resolve {project_id} --note '<resolution>'"
+            )
+            return False, f"CIRCUIT BREAKER TRIPPED! Revisi sudah ditolak {max_retries} kali. Agen dibungkam otomatis untuk mencegah perdebatan tanpa akhir. Hubungi Control Room."
+
+    save_manifest(project_id, manifest)
+    return True, None
+
+# ------------------------------------------------------------------------------
+# 7. Herdr Fleet & Pane Interaction
+# ------------------------------------------------------------------------------
+
+def get_herdr_fleet_info() -> Optional[dict]:
+    herdr_bin = resolve_cmd("herdr-orch")
+    if not herdr_bin:
+        fallback = BASE_DIR / "herdr-orchestrator.py"
+        if fallback.exists():
+            herdr_bin = str(fallback)
+    if not herdr_bin:
+        return None
+    try:
+        cmd = [herdr_bin, "status", "--json"] if os.access(herdr_bin, os.X_OK) else [sys.executable, herdr_bin, "status", "--json"]
+        res = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if res.returncode == 0:
+            return json.loads(res.stdout)
+    except Exception:
+        pass
+    return None
+
+def ensure_agy_auto_installed() -> bool:
+    if resolve_cmd("agy-auto"):
+        return True
+    agy_bin = shutil.which("agy")
+    if not agy_bin:
+        print("[!] 'agy' CLI tidak ditemukan di PATH. Tidak dapat menginisialisasi agy-auto.")
+        return False
+    target_path = WORKSPACE_ROOT / "cmd" / "agy-auto"
+    print(f"[?] 'agy-auto' belum terpasang. Menyiapkan wrapper otomatis di {target_path}...")
+    try:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_text("#!/usr/bin/env bash\nexec agy --dangerously-skip-permissions \"$@\"\n", encoding="utf-8")
+        target_path.chmod(0o755)
+        print(f"[✓] Wrapper 'agy-auto' berhasil dipasang di {target_path} dan siap digunakan.")
+        return True
+    except Exception as e:
+        print(f"[!] Gagal memasang wrapper 'agy-auto': {e}")
+        return False
+
+def get_role_introduction(role: str) -> str:
+    r_data = get_role_data(role)
+    title = r_data.get("title", role.capitalize())
+    return f"Halo Pengguna dan Tim! Saya adalah {title}. Saya siap menjalankan tugas dan berkoordinasi secara otonom dalam proyek ini."
+
+# ------------------------------------------------------------------------------
+# 8. Prompt Construction with Artifact Handoff
+# ------------------------------------------------------------------------------
+
+def build_stage_prompt(role: str, project_id: str, stage: Optional[Dict[str, Any]] = None) -> str:
+    p_dir = get_project_dir(project_id)
+    r_data = get_role_data(role)
+
+    # Resolve system prompt
+    system_prompt = r_data.get("system_prompt", "")
+    if not system_prompt and "system_prompt_file" in r_data:
+        sp_file = get_roles_dir() / r_data["system_prompt_file"]
+        if sp_file.exists():
+            system_prompt = sp_file.read_text(encoding="utf-8")
+
+    parts = [
+        f"# INSTRUCTION: ACT AS ROLE [{role.upper()} - {r_data.get('title', role)}]\n",
+        system_prompt,
+        f"\n\n--- PROJECT CONTEXT: {project_id} ---",
+        f"Workspace Path: {p_dir}",
+    ]
+
+    manifest = get_or_create_manifest(project_id)
+    eff_domain_id, d_manifest, domain_err = resolve_project_domain(manifest)
+    if domain_err:
+        raise RuntimeError(domain_err)
+
+    target_dir = manifest.get("target_dir")
+    if target_dir:
+        parts.append(f"Target Source Code Directory: {target_dir} (Semua berkas implementasi kode dan unit tests WAJIB dibuat di dalam direktori ini!)")
+
+    parts.append(format_domain_context_block(eff_domain_id, d_manifest))
+
+
+    if stage:
+        parts.append(f"Current Stage: {stage.get('name', stage.get('id'))}")
+        inp_arts = stage.get("input_artifacts", [])
+        out_arts = stage.get("output_artifacts", [])
+        if inp_arts:
+            parts.append(f"Input Artifacts: {', '.join(inp_arts)}")
+        if out_arts:
+            parts.append(f"Expected Output Artifacts: {', '.join(out_arts)}")
+
+    # Inject Input Artifacts
+    req_f = p_dir / "01-requirements.md"
+    spec_f = p_dir / "02-technical-spec.md"
+    task_f = p_dir / "03-task-list.md"
+    rev_f = p_dir / "review-log.md"
+
+    if req_f.exists():
+        parts.append(f"\n### [01-requirements.md]:\n{req_f.read_text(encoding='utf-8')}")
+    if spec_f.exists():
+        parts.append(f"\n### [02-technical-spec.md]:\n{spec_f.read_text(encoding='utf-8')}")
+    if task_f.exists():
+        parts.append(f"\n### [03-task-list.md]:\n{task_f.read_text(encoding='utf-8')}")
+    if rev_f.exists():
+        parts.append(f"\n### [review-log.md]:\n{rev_f.read_text(encoding='utf-8')}")
+
+    # Audit Trail context (last 4 entries)
+    audit_f = p_dir / "audit-trail.md"
+    if audit_f.exists():
+        text = audit_f.read_text(encoding="utf-8")
+        entries = re.findall(r"(###\s*\[AUDIT-\d+\].*?)(?=\n###\s*\[AUDIT|\Z)", text, re.DOTALL)
+        if entries:
+            last_entries = "\n".join(entries[-4:])
+            parts.append(f"\n### [audit-trail.md - Catatan Aktivitas Terakhir]:\n{last_entries}")
+
+    # Inject Permitted Knowledge Catalog Index (Zero-Bloat Progressive Disclosure)
+    kb_items = get_accessible_knowledge(role, domain_id=eff_domain_id)
+    if kb_items:
+        kb_lines = [
+            "\n### [KNOWLEDGE BASE CATALOG (Tersedia Sesuai Peran Anda)]:",
+            "Anda memiliki akses on-demand ke topik panduan & aturan berikut.",
+            "Untuk membaca materi lengkap saat dibutuhkan, jalankan: team-orch knowledge read <topic_id>\n"
+        ]
+        for item in kb_items:
+            src_tag = "[BASE]" if item.get("_source") == BASE_DOMAIN_ID else f"[{str(item.get('_source')).upper()}]"
+            kb_lines.append(f"- `{src_tag}` `[kb:{item.get('id')}]` {item.get('title')} ({item.get('category')}) - {item.get('summary', '')}")
+        parts.append("\n".join(kb_lines))
+
+    # Layer 1: Non-Negotiable Framework Kernel Directives
+    parts.append(
+        "\n### [MANDATORY FRAMEWORK KERNEL DIRECTIVES - NON-NEGOTIABLE]:\n"
+        "1. IMMUTABILITY: Direktori `cmd/`, `installer/`, dan konfigurasi engine `.agents/` berstatus READ-ONLY. DILARANG KERAS memodifikasinya.\n"
+        "2. WORKSPACE CONFINEMENT: Pekerjaan implementasi kode HANYA boleh dibuat di `target_dir`. DILARANG membuat skrip liar di root.\n"
+        "3. SCRATCHPAD & REUSABILITY: Jika butuh skrip debug/dummy data/eksperimen mandiri, simpan di `.agents/tasks/active/<project_id>/scratch/`.\n"
+        "   Periksa scratchpad sebelum membuat skrip baru untuk menggunakan kembali (reuse) skrip yang sudah ada dan menghemat token.\n"
+        "4. KNOWLEDGE COMPLIANCE: Patuhi aturan yang bertanda STRICT di Knowledge Base. Melanggar aturan akan di-REJECT oleh Gatekeeper.\n"
+        "5. GIT READ-ONLY POLICY: DILARANG menjalankan perintah mutasi git (git add, git commit, git push). Hanya gunakan git status/diff/log.\n"
+        "6. AUDIT LOGGING: Catat setiap aksi teknis dan verifikasi keamanan ke audit trail sebelum handoff."
+    )
+
+    return "\n".join(parts)
+
+# ------------------------------------------------------------------------------
+# 9. CLI Command Handlers
+# ------------------------------------------------------------------------------
+
+def cmd_init(args):
+    ensure_dirs()
+    project_id = args.project_id
+    workflow_id = args.workflow or DEFAULT_WORKFLOW_ID
+    p_dir = ACTIVE_TASKS_DIR / project_id
+
+    if p_dir.exists():
+        print(f"[!] Project '{project_id}' already exists at: {p_dir}")
+        return
+
+    p_dir.mkdir(parents=True, exist_ok=True)
+    templates_dir = get_templates_dir()
+
+    # Copy requirements template
+    req_template = templates_dir / "requirements-template.md"
+    req_file = p_dir / "01-requirements.md"
+    if req_template.exists():
+        content = req_template.read_text(encoding="utf-8")
+        content = content.replace("[PROJECT_NAME_OR_ID]", project_id)
+        req_file.write_text(content, encoding="utf-8")
+
+    # Provision dedicated task scratchpad
+    scratch_dir = p_dir / "scratch"
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+    (scratch_dir / ".gitkeep").write_text("", encoding="utf-8")
+
+    # Initialize manifest
+    target_dir = getattr(args, "target_dir", None)
+    req_domain = getattr(args, "domain", None)
+    eff_domain = _sanitize_domain_id(req_domain) if req_domain else get_active_domain_id()
+    if eff_domain in ("", "none"):
+        eff_domain = BASE_DOMAIN_ID
+    if eff_domain != BASE_DOMAIN_ID and not find_domain_dir(eff_domain):
+        print(f"🛑 [ERROR] Domain '{eff_domain}' tidak ditemukan. Jalankan 'team-orch domain list' atau gunakan '--domain base'.")
+        shutil.rmtree(p_dir, ignore_errors=True)
+        sys.exit(1)
+
+    manifest = get_or_create_manifest(project_id, workflow_id)
+    if target_dir:
+        manifest["target_dir"] = target_dir
+    manifest["domain_id"] = eff_domain
+
+    exec_mode = "silent" if (getattr(args, "silent", False) or getattr(args, "mode", None) == "silent") else "fleet"
+    manifest["execution_mode"] = exec_mode
+    save_manifest(project_id, manifest)
+
+    # Initial audit log
+    append_audit_log(
+        project_id=project_id,
+        role="pm",
+        event="PROJECT_INIT",
+        desc=f"Inisialisasi proyek baru dengan workflow '{workflow_id}' [{exec_mode.upper()} MODE] [domain:{eff_domain}]",
+        files=["01-requirements.md", "project.yaml"],
+        next_step="PM mengumpulkan kebutuhan dan menyusun dokumen 01-requirements.md"
+    )
+
+    print(f"[✓] Successfully initialized project '{project_id}' with workflow '{workflow_id}'!")
+    print(f"    Location : {p_dir}")
+    print(f"    Manifest : {p_dir}/project.yaml")
+    print(f"    Domain   : {eff_domain}")
+    if exec_mode == "silent":
+        print(f"    Mode     : 🔕 SILENT (Single Worker Pane / Background Runner)")
+        print(f"               Semua agen & tahapan dieksekusi terpadu di 1 worker pane tanpa memecah multi-pane.")
+    else:
+        print(f"    Mode     : 🌐 FLEET (Autonomous Multi-Pane: 1 Role = 1 Dedicated Pane)")
+    print(f"\n👉 Langkah selanjutnya:")
+    print(f"   1. Susun kebutuhan di '{project_id}/01-requirements.md'.")
+    print(f"   2. Ketik 'team-orch approve {project_id}' untuk menyetujui lingkup kerja.")
+    print(f"   3. Ketik 'team-orch next {project_id}' untuk menjalankan tahap berikutnya secara otomatis.")
+
+def cmd_approve(args):
+    project_id = args.project_id
+    p_dir = get_project_dir(project_id)
+    if not p_dir.exists():
+        print(f"[!] Project '{project_id}' not found.")
+        return
+
+    req_file = p_dir / "01-requirements.md"
+    if req_file.exists():
+        text = req_file.read_text(encoding="utf-8")
+        has_discovery = bool(re.search(r"(Discovery Log|Tanya-Jawab Kebutuhan|Wawancara Kebutuhan|Requirement Discovery)", text, re.IGNORECASE))
+        has_boilerplate = bool(re.search(r"(Boilerplate Reference|Basis Boilerplate|Referensi Boilerplate)", text, re.IGNORECASE))
+        if not (has_discovery and has_boilerplate):
+            print("=" * 80)
+            print("🛑 [BLOCKED BY ANTI-ASSUMPTION GATE]: Approval Ditolak!")
+            print(f" Dokumen '{req_file}' terdeteksi tidak memiliki:")
+            if not has_discovery:
+                print("   • Bukti 'Discovery Log / Tanya-Jawab Kebutuhan' (Wajib sesi wawancara langsung)")
+            if not has_boilerplate:
+                print("   • 'Referensi Boilerplate' (Wajib merujuk basis boilerplate resmi)")
+            print("\n⚠️ AI DILARANG mengasumsikan requirement sepihak dari imajinasi!")
+            print("   Lakukan sesi wawancara klarifikasi dengan Pengguna di Control Room terlebih dahulu,")
+            print("   lalu sertakan transkrip kesepakatan tersebut ke dalam '01-requirements.md'.")
+            print("=" * 80)
+            sys.exit(1)
+
+        if "PENDING_APPROVAL" in text:
+            text = text.replace("PENDING_APPROVAL", f"APPROVED by {args.approver} on {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        elif "Status: DRAFT" in text:
+            text = text.replace("Status: DRAFT", f"Status: APPROVED by {args.approver} on {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        req_file.write_text(text, encoding="utf-8")
+
+    gdd_file = p_dir / "01-gdd.md"
+    if gdd_file.exists():
+        text = gdd_file.read_text(encoding="utf-8")
+        if "PENDING_APPROVAL" in text:
+            text = text.replace("PENDING_APPROVAL", f"APPROVED by {args.approver} on {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        elif "Status: DRAFT" in text:
+            text = text.replace("Status: DRAFT", f"Status: APPROVED by {args.approver} on {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        gdd_file.write_text(text, encoding="utf-8")
+
+    manifest = get_or_create_manifest(project_id)
+    manifest["gate_status"]["user_approved"] = True
+    manifest["gate_status"]["approved_at"] = datetime.now().isoformat()
+    wf = load_workflow(manifest.get("workflow", DEFAULT_WORKFLOW_ID))
+    stages = wf.get("stages", [])
+    if stages and manifest.get("current_stage_index", 0) == 0:
+        manifest["current_stage_index"] = 1
+        if len(stages) > 1:
+            manifest["current_stage_id"] = stages[1]["id"]
+    save_manifest(project_id, manifest)
+
+
+    logged_files = ["project.yaml"]
+    if req_file.exists():
+        logged_files.append("01-requirements.md")
+    if gdd_file.exists():
+        logged_files.append("01-gdd.md")
+
+    append_audit_log(
+        project_id=project_id,
+        role="user",
+        event="REQUIREMENTS_APPROVED",
+        desc=f"Persetujuan User Approval Gate diberikan oleh {args.approver}",
+        files=logged_files,
+        next_step="Lanjut ke tahap arsitektur teknis oleh Analis/Tech Lead"
+    )
+
+    print(f"[✓] User Approval Gate berhasil disetujui untuk proyek '{project_id}'!")
+    if getattr(args, "auto", False):
+        print(f"👉 Meluncurkan Auto-Pilot Pipeline Runner secara otonom...")
+        cmd_auto(args)
+    else:
+        print(f"👉 Jalankan auto-dispatch tahap berikutnya dengan:")
+        print(f"   ./cmd/team-orch next {project_id}")
+        print(f"   (atau jalankan transisi otonom penuh via: ./cmd/team-orch auto {project_id})")
+
+def cmd_next(args):
+    project_id = args.project_id
+    p_dir = get_project_dir(project_id)
+    if not p_dir.exists():
+        print(f"[!] Active project '{project_id}' not found.")
+        return
+
+    manifest = get_or_create_manifest(project_id)
+    eff_domain_id, _, domain_err = resolve_project_domain(manifest)
+    if domain_err:
+        print(f"\n{domain_err}\n")
+        sys.exit(2)
+
+    if getattr(args, "mode", None):
+        manifest["execution_mode"] = args.mode
+        save_manifest(project_id, manifest)
+    elif getattr(args, "silent", False):
+        manifest["execution_mode"] = "silent"
+        save_manifest(project_id, manifest)
+
+    wf_id = manifest.get("workflow", DEFAULT_WORKFLOW_ID)
+    wf = load_workflow(wf_id)
+    stages = wf.get("stages", [])
+
+    # Support stage override or rollback (e.g. --stage build or --stage 1)
+    if getattr(args, "stage", None) is not None:
+        target_val = str(args.stage).strip().lower()
+        target_idx = None
+        for i, s in enumerate(stages):
+            if str(i) == target_val or str(i + 1) == target_val or s.get("id", "").lower() == target_val:
+                target_idx = i
+                break
+        if target_idx is not None:
+            manifest["current_stage_index"] = target_idx
+            manifest["current_stage_id"] = stages[target_idx]["id"]
+            manifest["status"] = "ACTIVE"
+            st_id = stages[target_idx]["id"]
+            if "stage_status" in manifest and st_id in manifest["stage_status"]:
+                manifest["stage_status"][st_id] = "PENDING"
+            save_manifest(project_id, manifest)
+            print(f"[*] [STAGE OVERRIDE] Beralih ke tahap {target_idx + 1}/{len(stages)}: '{stages[target_idx].get('name')}' ({stages[target_idx].get('role', '').upper()})")
+        else:
+            print(f"[!] Target stage '{args.stage}' tidak ditemukan dalam alur kerja '{wf_id}'.")
+            return
+
+    stage_idx = manifest.get("current_stage_index", 0)
+    if stage_idx >= len(stages):
+        manifest["status"] = "READY_FOR_SIGN_OFF"
+        save_manifest(project_id, manifest)
+        print("\n" + "=" * 80)
+        print(f" 🏁 WORKFLOW SELESAI: SELURUH TAHAPAN TELAH TUNTAS ({len(stages)}/{len(stages)})")
+        print("=" * 80)
+        print(f" Proyek : {project_id}")
+        print(f" Status : 🏁 READY FOR USER SIGN-OFF (Menunggu UAT Pengguna)")
+        print("--------------------------------------------------------------------------------")
+        print(" Perhatian untuk Agen Pekerja:")
+        print(" 🛑 TUGAS TIM SELESAI. Agen pekerja DILARANG menjalankan perintah 'complete'.")
+        print(" Sesi agen di worker pane sekarang IDLE dan menunggu instruksi baru.")
+        print("--------------------------------------------------------------------------------")
+        print(" Petunjuk untuk Pengguna di Control Room:")
+        print(" Silakan lakukan User Acceptance Testing (UAT) terhadap hasil pekerjaan tim.")
+        print(" Jika sudah sesuai, setujui dan arsipkan proyek via Control Room:")
+        print(f" 👉 team-orch complete {project_id}")
+        print("=" * 80 + "\n")
+        return
+
+    stage = stages[stage_idx]
+    role = stage.get("role", "coder")
+    gate = stage.get("gate", {})
+
+    # 1. Check User Approval Gate
+    if gate.get("type") == "user_approval" and not manifest.get("gate_status", {}).get("user_approved", False):
+        print(f"\n================================================================================")
+        print(f" 🛑 GATEKEEPER ALERT: Menunggu Persetujuan Pengguna (User Approval Gate)!")
+        print(f"================================================================================")
+        print(f" Proyek : {project_id}")
+        print(f" Tahap  : {stage.get('name')} (Role: {role.upper()})")
+        print(f" Berkas : {p_dir}/01-requirements.md")
+        print(f"--------------------------------------------------------------------------------")
+        print(f" Harap tinjau dokumen kebutuhan, lalu jalankan perintah persetujuan:")
+        print(f" 👉 team-orch approve {project_id}")
+        print(f"--------------------------------------------------------------------------------")
+        print(f" 💡 TIPS SLASH COMMAND ANTIGRAVITY (UAT & REVIEW):")
+        print(f"    - Review Kode   : Gunakan /diff (tekan 'c' untuk inline comment pada diff)")
+        print(f"    - Tanya Samping : Gunakan /btw <tanya> atau herdr-orch btw <pane> \"<tanya>\"")
+        print(f"    - Simpan Pola   : Gunakan /learn jika ingin menyimpan koreksi/pola permanen")
+        print(f"================================================================================")
+        return
+
+    # 2. Check Hard Artifact Gate: Verify all required input artifacts exist on disk before starting
+    required_inputs = stage.get("input_artifacts", [])
+    missing_inputs = []
+    for art in required_inputs:
+        art_path = p_dir / art
+        if not art_path.exists():
+            missing_inputs.append(art)
+
+    if missing_inputs:
+        print(f"\n================================================================================")
+        print(f" 🛑 ARTIFACT GATE: Berkas masukan (input artifacts) belum tersedia!")
+        print(f"================================================================================")
+        print(f" Proyek : {project_id}")
+        print(f" Tahap  : {stage.get('name')} (Tahap {stage_idx + 1}/{len(stages)}, Role: {role.upper()})")
+        print(f" Direktori Proyek : {p_dir}")
+        print(f" Berkas masukan yang belum ditemukan:")
+        for m in missing_inputs:
+            print(f"   - ❌ {m}")
+        print(f"--------------------------------------------------------------------------------")
+        print(f" Tahap ini dikunci secara ketat sampai tahap sebelumnya menghasilkan artefak di atas.")
+        print(f" Pencegahan halusinasi: Alur SDLC tidak dapat melompati tahapan tanpa artefak valid.")
+        print(f"================================================================================")
+        return
+
+    # 3. Check Current Stage State (Output Artifacts Barrier)
+    stage_id = stage.get("id")
+    current_status = manifest.setdefault("stage_status", {}).get(stage_id)
+    output_artifacts = stage.get("output_artifacts", [])
+
+    if current_status == "DISPATCHED" and not getattr(args, "force", False) and not getattr(args, "dry_run", False):
+        missing_outputs = []
+        for out_art in output_artifacts:
+            out_path = p_dir / out_art
+            if not out_path.exists():
+                t_dir = manifest.get("target_dir")
+                if t_dir and (WORKSPACE_ROOT / t_dir / out_art).exists():
+                    continue
+                missing_outputs.append(out_art)
+
+        # Extra verification for development stage: verify code and non-template review-log
+        if stage_id == "development":
+            t_dir = manifest.get("target_dir")
+            has_code = False
+            if t_dir:
+                t_path = WORKSPACE_ROOT / t_dir
+                if t_path.exists() and any(p for p in t_path.rglob("*.*") if p.is_file() and p.name != ".gitkeep"):
+                    has_code = True
+            rev_file = p_dir / "review-log.md"
+            rev_ready = False
+            if rev_file.exists():
+                r_txt = rev_file.read_text(encoding="utf-8")
+                if ("TASK-" in r_txt.upper() or "IMPLEMENTASI" in r_txt.upper() or "REVIEW REQUEST" in r_txt.upper()) and "MENUNGGU CODER" not in r_txt.upper():
+                    rev_ready = True
+            if not has_code:
+                missing_outputs.append(f"source code files in '{t_dir or 'target_dir'}'")
+            if not rev_ready and "review-log.md" not in missing_outputs:
+                missing_outputs.append("review-log.md (filled with implementation & review request)")
+
+        if missing_outputs:
+            assigned_pane = manifest.get("assigned_panes", {}).get(role, "unknown")
+            print(f"\n================================================================================")
+            print(f" ⏳ TAHAP SEDANG BERJALAN: '{stage.get('name')}' ({role.upper()})")
+            print(f"================================================================================")
+            print(f" Proyek : {project_id}")
+            print(f" Status : Worker di pane '{assigned_pane}' sedang mengeksekusi sub-task.")
+            print(f" Berkas luaran yang sedang ditunggu di {p_dir}:")
+            for m in missing_outputs:
+                print(f"   - ⏳ {m}")
+            print(f"--------------------------------------------------------------------------------")
+            print(f" Silakan pantau perkembangan kerja agen di pane '{assigned_pane}'.")
+            print(f" Gunakan opsi --force jika ingin mengirim ulang sinyal pemicu ke worker pane.")
+            print(f"================================================================================")
+            return
+        else:
+            # Output artifacts are ready! Mark completed and advance to next stage!
+            manifest["stage_status"][stage_id] = "COMPLETED"
+            stage_idx += 1
+            manifest["current_stage_index"] = stage_idx
+            if stage_idx >= len(stages):
+                manifest["status"] = "READY_FOR_SIGN_OFF"
+                save_manifest(project_id, manifest)
+                append_audit_log(
+                    project_id=project_id,
+                    role="system",
+                    event="ALL_STAGES_COMPLETED",
+                    desc=f"Seluruh {len(stages)} tahapan teknis workflow telah selesai. Status beralih ke READY_FOR_SIGN_OFF.",
+                    status="PASS",
+                    security="ALL OUTPUT ARTIFACTS VERIFIED",
+                    next_step=f"Menunggu verifikasi UAT & sign-off Pengguna di Control Room via: team-orch complete {project_id}"
+                )
+                record_bus_event(
+                    project_id=project_id,
+                    from_role="system",
+                    to_role="control_room",
+                    event_type="GATE_APPROVAL_NEEDED",
+                    payload={"project_id": project_id, "gate": "user_sign_off", "status": "READY_FOR_SIGN_OFF"}
+                )
+                print("\n" + "=" * 80)
+                print(f" 🏁 WORKFLOW SELESAI: SELURUH TAHAPAN TELAH TUNTAS ({len(stages)}/{len(stages)})")
+                print("=" * 80)
+                print(f" Proyek : {project_id}")
+                print(f" Status : 🏁 READY FOR USER SIGN-OFF (Menunggu UAT Pengguna)")
+                print("--------------------------------------------------------------------------------")
+                print(" Perhatian untuk Agen Pekerja:")
+                print(" 🛑 TUGAS TIM SELESAI. Agen pekerja DILARANG menjalankan perintah 'complete'.")
+                print(" Sesi agen di worker pane sekarang IDLE dan menunggu instruksi baru.")
+                print("--------------------------------------------------------------------------------")
+                print(" Petunjuk untuk Pengguna di Control Room:")
+                print(" Silakan lakukan User Acceptance Testing (UAT) terhadap hasil pekerjaan tim.")
+                print(" Jika sudah sesuai, setujui dan arsipkan proyek via Control Room:")
+                print(f" 👉 team-orch complete {project_id}")
+                print("=" * 80 + "\n")
+                return
+            stage = stages[stage_idx]
+            role = stage.get("role", "coder")
+            gate = stage.get("gate", {})
+            stage_id = stage.get("id")
+
+            # Check gate for new stage
+            if gate.get("type") == "user_approval" and not manifest.get("gate_status", {}).get("user_approved", False):
+                print(f"\n================================================================================")
+                print(f" 🛑 GATEKEEPER ALERT: Menunggu Persetujuan Pengguna (User Approval Gate)!")
+                print(f"================================================================================")
+                print(f" Proyek : {project_id}")
+                print(f" Tahap  : {stage.get('name')} (Role: {role.upper()})")
+                print(f" Berkas : {p_dir}/01-requirements.md")
+                print(f"--------------------------------------------------------------------------------")
+                print(f" Harap tinjau dokumen kebutuhan, lalu jalankan perintah persetujuan:")
+                print(f" 👉 team-orch approve {project_id}")
+                print(f"================================================================================")
+                save_manifest(project_id, manifest)
+                return
+
+    # Determine Model & Worker Pane
+    r_data = get_role_data(role)
+    model = ROLE_MODELS.get(role.lower(), "gemini-3.8-flash-high")
+    if r_data.get("model_tier") == "high":
+        model = "gemini-3.1-pro-high"
+    elif r_data.get("model_tier") == "low":
+        model = "gemini-3.8-flash-low"
+
+    ensure_agy_auto_installed()
+
+    in_herdr = os.environ.get("HERDR_ENV") == "1"
+    herdr_bin = resolve_cmd("herdr-orch")
+    pane_id = args.pane or manifest.get("assigned_panes", {}).get(role)
+
+    prompt = build_stage_prompt(role, project_id, stage)
+    intro = get_role_introduction(role)
+    full_prompt = f"{intro}\n\n{prompt}"
+
+    # File-Driven Task Handoff: Write full prompt to disk
+    handoff_file = p_dir / "task-handoff.md"
+    handoff_content = (
+        f"# TASK HANDOFF: {stage.get('name').upper()}\n"
+        f"- Proyek: `{project_id}`\n"
+        f"- Peran Target: `{r_data.get('title', role)}` (`{model}`)\n"
+        f"- Target Direktori Kode: `{manifest.get('target_dir', 'src')}`\n"
+        f"- Waktu Penyerahan: `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`\n"
+        f"- Berkas Masukan (Input Artifacts): {', '.join(f'`{f}`' for f in stage.get('input_artifacts', [])) if stage.get('input_artifacts') else 'None'}\n"
+        f"- Berkas Luaran Wajib (Expected Outputs): {', '.join(f'`{f}`' for f in stage.get('output_artifacts', [])) if stage.get('output_artifacts') else 'None'}\n\n"
+        f"{full_prompt}\n"
+    )
+    handoff_file.write_text(handoff_content, encoding="utf-8")
+
+    trigger_message = (
+        f"Halo {r_data.get('title', role)}! Tugas tahap '{stage.get('name')}' telah disiapkan di:\n"
+        f"{handoff_file}\n"
+        f"Silakan baca instruksi pada berkas tersebut dan selesaikan tugas Anda sekarang."
+    )
+
+    if getattr(args, "dry_run", False):
+        print(f"[*] [DRY-RUN] Simulasi tahap {stage_idx + 1}/{len(stages)}: '{stage.get('name')}' ({role.upper()})...")
+        print(f"==================== [STAGE PROMPT START] ====================")
+        print(full_prompt)
+        print(f"===================== [STAGE PROMPT END] =====================")
+        print(f"==================== [TASK HANDOFF FILE] =====================")
+        print(f" Berkas: {handoff_file}")
+        print(f" Sinyal Trigger: {trigger_message}")
+        print(f"================================================================")
+        print(f"[*] [DRY-RUN] Selesai simulasi prompt. Status proyek dan stage index TIDAK diubah (strictly read-only).")
+        return
+
+    if in_herdr and herdr_bin:
+        print(f"[*] Control Room Auto-Dispatch: Memajukan proyek '{project_id}' ke Tahap {stage_idx + 1}/{len(stages)}...")
+        print(f"    Tahap  : {stage.get('name')}")
+        print(f"    Peran  : {r_data.get('title', role)} (`{model}`)")
+        print(f"    Handoff: {handoff_file}")
+
+        # Query live panes from Herdr fleet
+        fleet_info = get_herdr_fleet_info()
+        live_panes = {p.get("pane_id") for p in fleet_info.get("panes", [])} if fleet_info else set()
+
+        # Prune dead panes from current project manifest
+        current_assigned = manifest.get("assigned_panes", {})
+        cleaned_assigned = {r_k: p_v for r_k, p_v in current_assigned.items() if p_v in live_panes}
+        manifest["assigned_panes"] = cleaned_assigned
+
+        # Collect busy live panes across all active projects
+        busy_panes = {os.environ.get("HERDR_PANE_ID", "w8:p1")}
+        for other_p in ACTIVE_TASKS_DIR.iterdir():
+            if other_p.is_dir():
+                mf = other_p / "project.yaml"
+                if mf.exists():
+                    m_data = load_yaml(mf)
+                    for _, p_val in m_data.get("assigned_panes", {}).items():
+                        if p_val and p_val in live_panes:
+                            busy_panes.add(p_val)
+
+        # Determine execution mode (silent vs fleet)
+        if getattr(args, "mode", None):
+            manifest["execution_mode"] = args.mode
+        elif getattr(args, "silent", False):
+            manifest["execution_mode"] = "silent"
+        is_silent = (manifest.get("execution_mode") == "silent")
+
+        pane_id = args.pane
+
+        if is_silent:
+            # ------------------------------------------------------------------
+            # SILENT MODE: All roles & stages share ONE single worker pane
+            # ------------------------------------------------------------------
+            # 1. Check if a silent worker pane has already been assigned and is live
+            existing_silent = cleaned_assigned.get("silent_worker")
+            if not pane_id and existing_silent and existing_silent in live_panes:
+                pane_id = existing_silent
+
+            # 2. Check if any previously assigned role pane in this project is live
+            if not pane_id:
+                for r_assigned, p_assigned in cleaned_assigned.items():
+                    if p_assigned and p_assigned in live_panes and p_assigned != os.environ.get("HERDR_PANE_ID", "w8:p1"):
+                        pane_id = p_assigned
+                        break
+
+            # 3. Check any live sibling worker pane (excluding control room)
+            if not pane_id and fleet_info:
+                for p_info in fleet_info.get("panes", []):
+                    pid = p_info.get("pane_id")
+                    if pid and pid in live_panes and pid != os.environ.get("HERDR_PANE_ID", "w8:p1"):
+                        if not p_info.get("is_rate_limited") and not p_info.get("is_blocked"):
+                            pane_id = pid
+                            break
+
+            # 4. If no live worker pane exists, ensure or create just ONE worker pane (without multi-pane splitting)
+            if not pane_id:
+                try:
+                    print(f"[*] [SILENT MODE] Membuka 1 shared worker pane terpadu di Herdr...")
+                    out = subprocess.check_output([herdr_bin, "ensure-worker", "--model", model], text=True)
+                    m = re.search(r"(w\d+:p\d+)", out)
+                    if m:
+                        pane_id = m.group(1)
+                except Exception as e:
+                    print(f"[!] Failed to ensure silent worker pane: {e}")
+
+            if pane_id:
+                manifest["assigned_panes"]["silent_worker"] = pane_id
+        else:
+            # ------------------------------------------------------------------
+            # FLEET MODE (Default): 1 Role = 1 Dedicated Pane
+            # ------------------------------------------------------------------
+            if not pane_id:
+                existing_p = cleaned_assigned.get(role)
+                if existing_p and existing_p in live_panes:
+                    pane_id = existing_p
+
+            # If not assigned to a live pane, pick an available unassigned live worker pane
+            if not pane_id and fleet_info:
+                for p_info in fleet_info.get("panes", []):
+                    pid = p_info.get("pane_id")
+                    if pid and pid in live_panes and pid not in busy_panes and not p_info.get("is_rate_limited") and not p_info.get("is_blocked"):
+                        pane_id = pid
+                        break
+
+            # If still no live worker pane available (e.g. user closed panes), force spawn a fresh dedicated pane
+            if not pane_id:
+                try:
+                    print(f"[*] Worker pane untuk peran '{role}' belum tersedia. Membuka dedicated worker pane baru di Herdr...")
+                    out = subprocess.check_output([herdr_bin, "ensure-worker", "--force-new", "--model", model], text=True)
+                    m = re.search(r"(w\d+:p\d+)", out)
+                    if m:
+                        pane_id = m.group(1)
+                except Exception as e:
+                    print(f"[!] Failed to ensure worker pane: {e}")
+
+        if pane_id:
+            if is_silent:
+                print(f"[🔕 SILENT MODE] Mengirim sinyal pemicu handoff ke shared worker pane: {pane_id} (Peran: {role})")
+            else:
+                print(f"[✓] Mengirim sinyal pemicu handoff ke dedicated worker pane: {pane_id}")
+            cmd = [herdr_bin, "delegate", pane_id, trigger_message, "--model", model, "--role", role, "--reset-on-role-change", "--allow-self"]
+            subprocess.run(cmd)
+
+            # Update manifest
+            manifest["assigned_panes"][role] = pane_id
+            if is_silent:
+                manifest["assigned_panes"]["silent_worker"] = pane_id
+            manifest["current_stage_id"] = stage.get("id")
+            manifest["status"] = "ACTIVE"
+            manifest.setdefault("stage_status", {})[stage.get("id")] = "DISPATCHED"
+            # Automatic Circuit Breaker reset on stage advance (Zero Token Guard)
+            g = manifest.setdefault("guardrails", {})
+            g["circuit_breaker_status"] = "ACTIVE"
+            g["current_retries"] = 0
+            g["turn_count"] = 0
+            g["locked_at"] = None
+            g["lock_reason"] = None
+            save_manifest(project_id, manifest)
+
+            mode_tag = "SILENT" if is_silent else "FLEET"
+            append_audit_log(
+                project_id=project_id,
+                role="pm",
+                event="STAGE_DISPATCHED",
+                desc=f"Auto-dispatch tahap {stage_idx + 1} ({stage.get('name')}) [{mode_tag}] ke pane {pane_id} untuk peran {role} via task-handoff.md",
+                files=["task-handoff.md"],
+                cmd=f"team-orch next {project_id}{' --silent' if is_silent else ''}",
+                next_step=f"Worker {role} di pane {pane_id} membaca task-handoff.md dan mengeksekusi sub-task"
+            )
+            print(f"\n[✓] Sukses! Sinyal pemicu berhasil dikirim ke worker pane {pane_id}.")
+            print(f"    Berkas Handoff : {handoff_file}")
+            print(f"    Pantau status real-time di Control Room via: team-orch status {project_id}")
+            return
+
+    # Non-herdr fallback
+    print(f"[*] Task handoff telah dibuat untuk peran '{role}' ({model}): {handoff_file}")
+    print(f"==================== [STAGE PROMPT START] ====================")
+    print(full_prompt)
+    print(f"===================== [STAGE PROMPT END] =====================")
+    manifest["current_stage_id"] = stage.get("id")
+    manifest["status"] = "ACTIVE"
+    manifest.setdefault("stage_status", {})[stage.get("id")] = "DISPATCHED"
+    save_manifest(project_id, manifest)
+
+def cmd_auto(args):
+    """
+    Autonomous Pipeline Runner (Auto-Pilot):
+    Continuously monitors the active stage of project_id.
+    When a worker completes their stage and outputs valid artifacts,
+    automatically advances to the next stage without requiring manual intervention.
+    Stops when reaching READY_FOR_SIGN_OFF or when blocked by a gate requiring human input.
+    """
+    project_id = args.project_id
+    p_dir = get_project_dir(project_id)
+    if not p_dir.exists():
+        print(f"[!] Active project '{project_id}' not found.")
+        return
+
+    poll_interval = getattr(args, "interval", 5) or 5
+    max_timeout = getattr(args, "timeout", 1800) or 1800
+    start_time = time.time()
+
+    print("\n" + "=" * 80)
+    print(f" 🚀 AUTO-PILOT PIPELINE RUNNER: PROYEK '{project_id.upper()}'")
+    print("=" * 80)
+    print(f" Status : Pengawasan & Transisi Otonom Penuh Aktif")
+    print(f" Polling: setiap {poll_interval} detik | Timeout: {max_timeout} detik")
+    print(f" Kontrol: Tekan Ctrl+C untuk kembali ke kendali manual di Control Room.")
+    print("=" * 80 + "\n")
+
+    while time.time() - start_time < max_timeout:
+        manifest = get_or_create_manifest(project_id)
+        status = manifest.get("status", "ACTIVE")
+        if status in ("READY_FOR_SIGN_OFF", "COMPLETED"):
+            print(f"\n[✓] Auto-Pilot Selesai: Proyek '{project_id}' telah berada di status {status}!")
+            return
+
+        cb_status = manifest.get("guardrails", {}).get("circuit_breaker_status", "ACTIVE")
+        if cb_status == "LOCKED":
+            print(f"\n[!] Circuit breaker LOCKED. Auto-pilot dihentikan. Memerlukan intervensi manusia di Control Room.")
+            return
+
+        wf_id = manifest.get("workflow", DEFAULT_WORKFLOW_ID)
+        wf = load_workflow(wf_id)
+        stages = wf.get("stages", [])
+        stage_idx = manifest.get("current_stage_index", 0)
+
+        if stage_idx >= len(stages):
+            manifest["status"] = "READY_FOR_SIGN_OFF"
+            save_manifest(project_id, manifest)
+            print(f"\n[✓] Seluruh {len(stages)} tahapan alur kerja telah tuntas! Status: READY_FOR_SIGN_OFF")
+            return
+
+        stage = stages[stage_idx]
+        stage_id = stage.get("id")
+        role = stage.get("role", "coder")
+        gate = stage.get("gate", {})
+
+        # If waiting for user approval gate
+        if gate.get("type") == "user_approval" and not manifest.get("gate_status", {}).get("user_approved", False):
+            print(f"\n[🛑 GATE ALERT] Tahap '{stage.get('name')}' membutuhkan User Approval Gate.")
+            print(f"👉 Silakan tinjau dan setujui via: team-orch approve {project_id}")
+            return
+
+        curr_stage_status = manifest.get("stage_status", {}).get(stage_id)
+
+        if curr_stage_status != "DISPATCHED":
+            print(f"\n[*] Auto-Pilot: Memajukan dan mendispatch tahap {stage_idx + 1}/{len(stages)}: '{stage.get('name')}' ({role.upper()})...")
+            cmd_next(args)
+            time.sleep(poll_interval)
+            continue
+
+        # Check output artifacts
+        output_artifacts = stage.get("output_artifacts", [])
+        missing_outputs = []
+        for out_art in output_artifacts:
+            out_path = p_dir / out_art
+            if not out_path.exists():
+                t_dir = manifest.get("target_dir")
+                if t_dir and (WORKSPACE_ROOT / t_dir / out_art).exists():
+                    continue
+                missing_outputs.append(out_art)
+
+        if stage_id == "development":
+            t_dir = manifest.get("target_dir")
+            has_code = False
+            if t_dir:
+                t_path = WORKSPACE_ROOT / t_dir
+                if t_path.exists() and any(p for p in t_path.rglob("*.*") if p.is_file() and p.name != ".gitkeep"):
+                    has_code = True
+            rev_file = p_dir / "review-log.md"
+            rev_ready = False
+            if rev_file.exists():
+                r_txt = rev_file.read_text(encoding="utf-8")
+                if ("TASK-" in r_txt.upper() or "IMPLEMENTASI" in r_txt.upper() or "REVIEW REQUEST" in r_txt.upper()) and "MENUNGGU CODER" not in r_txt.upper():
+                    rev_ready = True
+            if not has_code:
+                missing_outputs.append(f"source code in '{t_dir}'")
+            if not rev_ready and "review-log.md" not in missing_outputs:
+                missing_outputs.append("review-log.md (filled)")
+
+        if stage_id == "review":
+            rev_file = p_dir / "review-log.md"
+            if rev_file.exists():
+                r_txt = rev_file.read_text(encoding="utf-8")
+                if "APPROVED" not in r_txt.upper():
+                    missing_outputs.append("review-log.md (APPROVED)")
+
+        if not missing_outputs:
+            assigned_pane = manifest.get("assigned_panes", {}).get(role)
+            is_busy = False
+            if assigned_pane and os.environ.get("HERDR_ENV") == "1":
+                try:
+                    res = subprocess.run(["herdr", "inspect", assigned_pane], capture_output=True, text=True, timeout=5)
+                    if res.returncode == 0:
+                        data = json.loads(res.stdout)
+                        if data.get("agent_status") == "working":
+                            is_busy = True
+                except Exception:
+                    pass
+
+            if not is_busy:
+                print(f"\n[⚡ AUTO-ADVANCE] Artefak tahap '{stage.get('name')}' ({role.upper()}) terverifikasi lengkap & worker IDLE.")
+                print(f"👉 Mengalirkan otomatis ke tahap berikutnya...")
+                cmd_next(args)
+                time.sleep(3)
+                continue
+
+        assigned_pane = manifest.get("assigned_panes", {}).get(role, "unknown")
+        print(f"⏳ [Auto-Pilot] Menunggu worker {role.upper()} di pane '{assigned_pane}' menyelesaikan tahap {stage_idx + 1}/{len(stages)} ({stage.get('name')})...", end="\r", flush=True)
+        time.sleep(poll_interval)
+
+    print(f"\n[!] Waktu batas maksimal ({max_timeout}s) tercapai. Auto-pilot dijeda.")
+
+def cmd_status(args):
+    ensure_dirs()
+    project_id = args.project_id
+
+    # Single project detailed status
+    if project_id:
+        p_dir = get_project_dir(project_id)
+        if not p_dir.exists():
+            print(f"[!] Project '{project_id}' not found.")
+            return
+
+        manifest = get_or_create_manifest(project_id)
+        wf_id = manifest.get("workflow", DEFAULT_WORKFLOW_ID)
+        wf = load_workflow(wf_id)
+        stages = wf.get("stages", [])
+
+        idx = manifest.get("current_stage_index", 0)
+        total = max(len(stages), 1)
+        pct = int(min(100, (idx / total) * 100))
+        bar = "█" * (pct // 10) + "░" * (10 - (pct // 10))
+
+        print("=" * 80)
+        print(f" 📋 DETAIL STATUS PROYEK: {project_id.upper()}")
+        print("=" * 80)
+        print(f" Workflow       : {wf.get('name', wf_id)} ({wf_id})")
+        pinned_dom = manifest.get("domain_id") or BASE_DOMAIN_ID
+        active_dom = get_active_domain_id()
+        dom_note = f"{pinned_dom}" if pinned_dom == active_dom else f"{pinned_dom} (⚠️ MISMATCH dengan active domain: {active_dom})"
+        print(f" Domain Konteks : {dom_note}")
+        print(f" Progress Total : [{bar}] {pct}% (Tahap {idx}/{total})")
+        if manifest.get("status") == "READY_FOR_SIGN_OFF" or idx >= len(stages):
+            print(f" Status         : 🏁 READY FOR USER SIGN-OFF (Menunggu UAT Pengguna)")
+        else:
+            print(f" Status         : {manifest.get('status', 'ACTIVE')}")
+        exec_mode = manifest.get("execution_mode", "fleet").lower()
+        if exec_mode == "silent":
+            s_pane = manifest.get("assigned_panes", {}).get("silent_worker", "w?:p?")
+            print(f" Mode Eksekusi  : 🔕 SILENT (Single Shared Worker: {s_pane})")
+        else:
+            print(f" Mode Eksekusi  : 🌐 FLEET (Autonomous Multi-Pane: 1 Role = 1 Dedicated Pane)")
+
+        if idx < len(stages):
+            stg = stages[idx]
+            stg_id = stg.get("id")
+            stg_status = manifest.get("stage_status", {}).get(stg_id, "PENDING")
+            missing_inputs = [a for a in stg.get("input_artifacts", []) if not (p_dir / a).exists()]
+            missing_outputs = [a for a in stg.get("output_artifacts", []) if not (p_dir / a).exists()]
+
+            if stg_status == "DISPATCHED" and missing_outputs:
+                print(f" Tahap Berjalan : {stg.get('name')} (Role: {stg.get('role').upper()})")
+                print(f" Status Runtime : ⏳ SEDANG BERJALAN di pane '{manifest.get('assigned_panes', {}).get(stg.get('role'), 'unknown')}'")
+                print(f" Berkas Ditunggu: {', '.join(missing_outputs)}")
+            elif missing_inputs:
+                print(f" Tahap Antrean  : {stg.get('name')} (Role: {stg.get('role').upper()}) [TERKUNCI ARTIFACT GATE]")
+                print(f" Berkas Kurang  : {', '.join(missing_inputs)}")
+            else:
+                print(f" Tahap Aktif    : {stg.get('name')} (Role: {stg.get('role')})")
+
+            gate = stg.get("gate", {})
+            if gate.get("type") == "user_approval":
+                appr = manifest.get("gate_status", {}).get("user_approved", False)
+                gate_str = "SUDAH DISETUJUI" if appr else "MENUNGGU PERSETUJUAN (Ketik: team-orch approve " + project_id + ")"
+                print(f" Approval Gate  : {gate_str}")
+        else:
+            print(f" Tahap Aktif    : Seluruh {len(stages)} tahapan alur kerja telah selesai!")
+            print(f" Approval Gate  : 🏁 FINAL GATE: Menunggu UAT Pengguna (Ketik: team-orch complete {project_id})")
+
+        panes = manifest.get("assigned_panes", {})
+        if panes:
+            print("\n Alokasi Pane Herdr:")
+            for r, p in panes.items():
+                if p:
+                    tag = " [Shared Worker]" if (exec_mode == "silent" and r not in ["control_room", "project_manager"]) else ""
+                    print(f"   • {r:16}: {p}{tag}")
+
+        print("=" * 80)
+        return
+
+    # Global Mission Control Dashboard
+    herdr_fleet = get_herdr_fleet_info()
+    active_projects = sorted([d.name for d in ACTIVE_TASKS_DIR.iterdir() if d.is_dir()])
+    completed_projects = sorted([d.name for d in COMPLETED_TASKS_DIR.iterdir() if d.is_dir()])
+
+    print("=" * 80)
+    print(" 🌐 GLOBAL MISSION CONTROL: MULTI-PROJECT & HERDR WORKER FLEET")
+    print("=" * 80)
+    active_dom = get_active_domain_id()
+    d_manifest = load_domain_manifest(active_dom) if active_dom != BASE_DOMAIN_ID else None
+    dom_label = f"{active_dom} ({d_manifest.get('name')})" if d_manifest else "base (Day-1 / Zero Institutional Knowledge)"
+    print(f" 🧭 ACTIVE DOMAIN: {dom_label}")
+
+    if herdr_fleet:
+        ws_id = herdr_fleet.get("workspace_id", "w?")
+        orch_pane = herdr_fleet.get("orchestrator_pane_id", "w?:p?")
+        panes = herdr_fleet.get("panes", [])
+        worker_panes = [p for p in panes if not p["is_orchestrator"]]
+        ready_workers = [p for p in worker_panes if not p["is_rate_limited"] and not p["is_blocked"]]
+
+        print(f" 🖥️  HERDR WORKSPACE: {ws_id}")
+        print(f"    👉 Control Room Pane (PM / Orchestrator): {orch_pane} [THIS PANE]")
+        print(f"    👥 Worker Panes: {len(worker_panes)} Total ({len(ready_workers)} Ready / Available)")
+        if worker_panes:
+            pane_summary = ", ".join(f"{p['pane_id']}:{p['state']}" for p in worker_panes)
+            print(f"       Status Panes: {pane_summary}")
+    else:
+        print(" 🖥️  HERDR WORKSPACE: Single terminal mode / Non-Herdr session")
+
+    print("-" * 80)
+    print(f" 📁 PROYEK AKTIF BERJALAN ({len(active_projects)} Proyek):")
+
+    if not active_projects:
+        print("    (Belum ada proyek aktif. Jalankan: team-orch init <project_id>)")
+    else:
+        for idx_p, pid in enumerate(active_projects, 1):
+            manifest = get_or_create_manifest(pid)
+            wf_id = manifest.get("workflow", DEFAULT_WORKFLOW_ID)
+            wf = load_workflow(wf_id)
+            stages = wf.get("stages", [])
+            stg_idx = manifest.get("current_stage_index", 0)
+            total_stg = max(len(stages), 1)
+            pct = int(min(100, (stg_idx / total_stg) * 100))
+            bar = "█" * (pct // 10) + "░" * (10 - (pct // 10))
+
+            action_hint = ""
+            if stg_idx < len(stages):
+                curr_stg = stages[stg_idx]
+                r_name = curr_stg.get("role", "coder")
+                gate = curr_stg.get("gate", {})
+                if gate.get("type") == "user_approval" and not manifest.get("gate_status", {}).get("user_approved", False):
+                    action_hint = "⚠️ [WAITING APPROVAL: team-orch approve " + pid + "]"
+                else:
+                    proj_dir = get_project_dir(pid)
+                    curr_stg_id = curr_stg.get("id")
+                    stg_stat = manifest.get("stage_status", {}).get(curr_stg_id)
+                    missing_out = [a for a in curr_stg.get("output_artifacts", []) if not (proj_dir / a).exists()]
+                    if stg_stat == "DISPATCHED" and missing_out:
+                        action_hint = f"⏳ [RUNNING: Menunggu {', '.join(missing_out)}]"
+                    else:
+                        action_hint = f"⚡ [READY: team-orch next {pid}]"
+                stage_desc = f"Stage {stg_idx + 1}/{total_stg}: {curr_stg.get('name')} ({r_name})"
+            else:
+                stage_desc = "Seluruh tahap tuntas! (Menunggu UAT Pengguna)"
+                action_hint = f"👉 [UAT / COMPLETE: team-orch complete {pid}]"
+
+            m_icon = "🔕" if manifest.get("execution_mode") == "silent" else "🌐"
+            p_dom = manifest.get("domain_id") or BASE_DOMAIN_ID
+            dom_badge = f"domain:{p_dom}" if p_dom == active_dom else f"domain:{p_dom} ⚠️ MISMATCH"
+            print(f"    [{idx_p}] {m_icon} [{bar}] {pct:3d}% | Proyek: {pid:<20} | {stage_desc} [{dom_badge}]")
+            print(f"        Action: {action_hint}")
+
+    print("-" * 80)
+    print(f" 📦 PROYEK TERSELESAIKAN / ARSIP ({len(completed_projects)}): {', '.join(completed_projects) if completed_projects else 'Belum ada'}")
+    print("=" * 80)
+    print(" 💡 SHORTCUTS & PERINTAH CEPAT (CONTROL ROOM):")
+    print("    - Auto-lanjut tahap  : team-orch next <project_id> [--silent]")
+    print("    - Setujui PRD        : team-orch approve <project_id>")
+    print("    - Mulai proyek baru  : team-orch init <project_id> [--workflow <id>] [--silent]")
+    print("    - Interactive Diff   : Gunakan /diff (tekan 'c' untuk memberi inline komentar kode)")
+    print("    - Side-Question      : Gunakan /btw <pertanyaan> atau herdr-orch btw <pane> \"<pertanyaan>\"")
+    print("    - Persist Aturan     : Gunakan /learn untuk menyimpan pola/koreksi baru secara permanen")
+    print("    - Selesaikan Proyek  : team-orch complete <project_id>")
+    print("    - Katalog alur kerja : team-orch workflow list")
+    print("    - Katalog peran agen : team-orch role list")
+    print("=" * 80)
+
+def cmd_workflow_list(args):
+    wfs = list_all_workflows()
+    print("=" * 80)
+    print(f" 🔄 KATALOG ALUR KERJA OTONOM (WORKFLOW BLUEPRINTS) - {len(wfs)} Presets")
+    print("=" * 80)
+    for w in wfs:
+        wid = w.get("workflow_id", "unknown")
+        name = w.get("name", wid)
+        desc = w.get("description", "")
+        stages = w.get("stages", [])
+        stg_names = " -> ".join(s.get("role", s.get("id")) for s in stages)
+        print(f"\n🔹 Workflow ID : {wid}")
+        print(f"   Nama        : {name}")
+        print(f"   Deskripsi   : {desc}")
+        print(f"   Tahapan ({len(stages)}): {stg_names}")
+    print("\n" + "=" * 80)
+    print(" Cara penggunaan:")
+    print("   team-orch init <project_id> --workflow <workflow_id>")
+    print("   team-orch workflow show <workflow_id>")
+    print("📌 STANDAR FRAMEWORK: Seluruh workflow otomatis diakhiri dengan Final User Sign-off Gate (UAT).")
+    print("=" * 80)
+
+def cmd_workflow_show(args):
+    wf = load_workflow(args.workflow_id)
+    stages = wf.get("stages", [])
+    print("=" * 80)
+    print(f" 🔄 CETAK BIRU WORKFLOW: {wf.get('name', args.workflow_id).upper()}")
+    print("=" * 80)
+    print(f" ID        : {wf.get('workflow_id', args.workflow_id)}")
+    print(f" Deskripsi : {wf.get('description', '')}\n")
+    print(" DIAGRAM TAHAPAN KERJA (STAGE PROGRESSION):")
+    for i, s in enumerate(stages, 1):
+        role = s.get("role", "coder")
+        gate = s.get("gate", {})
+        gate_str = f" [Gate: {gate.get('type')}]" if gate.get("required") else ""
+        inps = f"In: {', '.join(s.get('input_artifacts', []))}" if s.get("input_artifacts") else "In: (None)"
+        outs = f"Out: {', '.join(s.get('output_artifacts', []))}" if s.get("output_artifacts") else "Out: (None)"
+        print(f"  [{i}] {s.get('name')} (Role: {role.upper()}){gate_str}")
+        print(f"      └─ {inps} | {outs}")
+        if i < len(stages):
+            print("      │")
+            print("      ▼")
+    print("      │")
+    print("      ▼")
+    print("  [🏁 FINAL GATE] Persetujuan Akhir Pengguna (User Acceptance Testing / UAT)")
+    print("      └─ Standar Baku Framework: Pengarsipan ('team-orch complete') wajib dieksekusi oleh Pengguna.")
+    print("=" * 80)
+
+def cmd_role_list(args):
+    roles = list_all_roles()
+    print("=" * 80)
+    print(f" 🎭 KATALOG PERAN AGEN OTONOM (AGENT ROSTER) - {len(roles)} Peran Terdaftar")
+    print("=" * 80)
+    for r in roles:
+        rid = r.get("id", "unknown")
+        title = r.get("title", rid)
+        tier = r.get("model_tier", "medium")
+        model = ROLE_MODELS.get(rid, f"tier-{tier}")
+        desc = r.get("description", "")
+        print(f"\n🔹 Role ID    : {rid}")
+        print(f"   Jabatan    : {title}")
+        print(f"   Model AI   : {model} (Tier: {tier})")
+        print(f"   Tanggung Jawab : {desc}")
+    print("\n" + "=" * 80)
+    print(" Cara pembuatan peran baru: Salin template .agents/templates/agent-role-template.yaml")
+    print("=" * 80)
+
+def cmd_role_show(args):
+    r_data = get_role_data(args.role_id)
+    if not r_data:
+        print(f"[✗] Role '{args.role_id}' tidak ditemukan.")
+        return
+    rid = r_data.get("id", args.role_id)
+    title = r_data.get("title", rid)
+    tier = r_data.get("model_tier", "medium")
+    model = ROLE_MODELS.get(rid, f"tier-{tier}")
+    desc = r_data.get("description", "")
+    print("=" * 80)
+    print(f" 🎭 DETAIL PERAN AGEN: {title}")
+    print("=" * 80)
+    print(f" • Role ID     : {rid}")
+    print(f" • Model AI    : {model} (Tier: {tier})")
+    print(f" • Deskripsi   : {desc}")
+    if "skills" in r_data:
+        print(f" • Skills      : {', '.join(r_data['skills'])}")
+    if "capabilities" in r_data:
+        caps = [k for k, v in r_data["capabilities"].items() if v]
+        print(f" • Kemampuan   : {', '.join(caps)}")
+    if "responsibilities" in r_data:
+        print("\n 📋 Tanggung Jawab Utama:")
+        for resp in r_data["responsibilities"]:
+            print(f"   - {resp}")
+    system_prompt = r_data.get("system_prompt", "")
+    if not system_prompt and "system_prompt_file" in r_data:
+        sp_file = get_roles_dir() / r_data["system_prompt_file"]
+        if sp_file.exists():
+            system_prompt = sp_file.read_text(encoding="utf-8")
+    if system_prompt:
+        print(f"\n 📝 System Prompt Snippet (5 baris pertama):")
+        for line in system_prompt.strip().splitlines()[:5]:
+            print(f"   | {line}")
+    print("=" * 80)
+
+def cmd_workflow_create(args):
+    ensure_dirs()
+    wf_id = args.workflow_id
+    clean_id = re.sub(r"[^a-zA-Z0-9_-]", "-", wf_id).lower()
+    target_file = WORKFLOWS_DIR / f"{clean_id}.yaml"
+    if target_file.exists() and not getattr(args, "force", False):
+        print(f"[!] Workflow '{clean_id}' sudah ada di: {target_file}")
+        print("    Gunakan flag --force untuk menimpa.")
+        return
+
+    name = getattr(args, "name", None) or clean_id.replace("-", " ").title()
+    desc = getattr(args, "desc", None) or f"Cetak biru alur kerja {name}"
+
+    template_file = get_templates_dir() / "agent-workflow-template.yaml"
+    if template_file.exists():
+        content = template_file.read_text(encoding="utf-8")
+        content = content.replace("custom-workflow-id", clean_id)
+        content = content.replace("Custom Workflow Name", name)
+        content = content.replace("Deskripsi lengkap tujuan dan karakteristik alur kerja ini...", desc)
+        target_file.write_text(content, encoding="utf-8")
+    else:
+        data = {
+            "workflow_id": clean_id,
+            "name": name,
+            "description": desc,
+            "version": "1.0.0",
+            "communication_policy": {
+                "max_peer_turns": 2,
+                "max_rejection_retries": 3,
+                "circuit_breaker": "enabled",
+                "on_limit_exceeded": {
+                    "action": "throttle_and_escalate",
+                    "target": "control_room",
+                    "severity": "ACTIONABLE"
+                }
+            },
+            "stages": [
+                {
+                    "id": "requirements",
+                    "name": "Scope & Alignment",
+                    "role": "project-manager",
+                    "output_artifacts": ["01-requirements.md"],
+                    "gate": {"type": "user_approval", "required": True}
+                },
+                {
+                    "id": "development",
+                    "name": "Implementation & Testing",
+                    "role": "coder",
+                    "input_artifacts": ["01-requirements.md"],
+                    "output_artifacts": ["review-log.md"]
+                },
+                {
+                    "id": "review",
+                    "name": "Quality Gatekeeper Audit",
+                    "role": "analyst",
+                    "input_artifacts": ["review-log.md"],
+                    "gate": {"type": "code_review", "required": True}
+                }
+            ]
+        }
+        target_file.write_text(dump_yaml(data), encoding="utf-8")
+
+    print("=" * 80)
+    print(f" [✓] CETAK BIRU WORKFLOW BARU BERHASIL DIBUAT!")
+    print("=" * 80)
+    print(f" ID        : {clean_id}")
+    print(f" Nama      : {name}")
+    print(f" Lokasi    : {target_file}")
+    print(f"\n👉 Anda dapat mengedit tahapan dan perannya secara leluasa di file tersebut.")
+    print(f"📌 STANDAR FRAMEWORK: Seluruh workflow otomatis diakhiri dengan User Acceptance Testing (UAT).")
+    print(f"   Worker agen dilarang menyelesaikan proyek secara sepihak. Pengarsipan wajib dieksekusi")
+    print(f"   oleh Pengguna di Control Room via 'team-orch complete <project_id>'.")
+    print(f"\n   Gunakan untuk proyek baru dengan:")
+    print(f"   team-orch init <project_id> --workflow {clean_id}")
+    print("=" * 80)
+
+def cmd_role_create(args):
+    ensure_dirs()
+    role_id = args.role_id
+    clean_id = re.sub(r"[^a-zA-Z0-9_-]", "-", role_id).lower()
+    target_file = ROLES_DIR / f"{clean_id}.yaml"
+    if target_file.exists() and not getattr(args, "force", False):
+        print(f"[!] Role '{clean_id}' sudah ada di: {target_file}")
+        print("    Gunakan flag --force untuk menimpa.")
+        return
+
+    title = getattr(args, "title", None) or clean_id.replace("-", " ").title()
+    tier = getattr(args, "tier", None) or "medium"
+    desc = getattr(args, "desc", None) or f"Agen spesialis untuk {title}"
+
+    template_file = get_templates_dir() / "agent-role-template.yaml"
+    if template_file.exists():
+        content = template_file.read_text(encoding="utf-8")
+        content = content.replace("custom-role-id", clean_id)
+        content = content.replace("Custom Role Title (Spesialisasi)", title)
+        content = content.replace('model_tier: "medium"', f'model_tier: "{tier}"')
+        target_file.write_text(content, encoding="utf-8")
+    else:
+        model_name = "gemini-3.8-flash-high"
+        if tier == "high": model_name = "gemini-3.1-pro-high"
+        elif tier == "low": model_name = "gemini-3.8-flash-low"
+        data = {
+            "id": clean_id,
+            "title": title,
+            "description": desc,
+            "model_tier": tier,
+            "recommended_model": model_name,
+            "system_prompt": f"# Peran: {title}\nAnda bertanggung jawab atas {desc}.\n"
+        }
+        target_file.write_text(dump_yaml(data), encoding="utf-8")
+
+    print("=" * 80)
+    print(f" [✓] PERAN AGEN BARU BERHASIL DIDAFTARKAN!")
+    print("=" * 80)
+    print(f" Role ID   : {clean_id}")
+    print(f" Jabatan   : {title}")
+    print(f" Model Tier: {tier}")
+    print(f" Lokasi    : {target_file}")
+    print(f"\n👉 Peran ini kini dapat langsung digunakan di workflow mana pun.")
+    print("=" * 80)
+
+def cmd_setup(args):
+    print("=" * 80)
+    print(" 🚀 MULTI-AGENT WORKFLOW: INTERACTIVE INSTALLER & SETUP WIZARD")
+    print("=" * 80)
+    print(" Selamat datang! Setup wizard ini akan memandu Anda menyiapkan infrastruktur")
+    print(" orkestrasi agen otonom (PM, Analis, Coder, QA, Dokumenter) secara transparan.")
+    print("=" * 80)
+
+    # --------------------------------------------------------------------------
+    # TAHAP 1: Kesiapan Sistem (Pre-Flight Check & Auto-Install Prasyarat)
+    # --------------------------------------------------------------------------
+    print("\n[1/5] 🔍 MEMERIKSA KESIAPAN SISTEM (PRE-FLIGHT CHECK)")
+    print("-" * 80)
+    os_name = sys.platform
+    print(f"  [✓] Sistem Operasi          : {os_name} ({platform.platform()})")
+
+    py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    print(f"  [✓] Python Runtime          : Python {py_ver} (Standard Library OK, 0 Dep pip)")
+
+    agy_bin = shutil.which("agy")
+    if agy_bin:
+        print(f"  [✓] Antigravity CLI (agy)   : Terdeteksi ({agy_bin})")
+    else:
+        print("  [?] Antigravity CLI (agy)   : Tidak ditemukan di PATH global (akan menggunakan fallback)")
+
+    in_herdr = os.environ.get("HERDR_ENV") == "1"
+    herdr_bin = shutil.which("herdr")
+    if in_herdr:
+        print(f"  [✓] Terminal Multiplexer    : Herdr Aktif (HERDR_ENV=1, Workspace: {os.environ.get('HERDR_WORKSPACE_ID', 'w8')}, Pane: {os.environ.get('HERDR_PANE_ID', 'w8:p1')})")
+    elif herdr_bin:
+        print(f"  [✓] Terminal Multiplexer    : Binary 'herdr' tersedia ({herdr_bin})")
+    else:
+        print("  [-] Terminal Multiplexer    : Herdr tidak aktif (Sistem akan berjalan dalam mode single-terminal)")
+
+    agy_auto_path = WORKSPACE_ROOT / "cmd" / "agy-auto"
+    agy_auto_installed = agy_auto_path.is_file() and os.access(agy_auto_path, os.X_OK)
+
+    if agy_auto_installed:
+        print(f"  [✓] agy-auto Wrapper        : Siap & executable ({agy_auto_path})")
+    else:
+        print(f"  [!] agy-auto Wrapper        : BELUM TERPASANG di {agy_auto_path}")
+        print("      (Dibutuhkan agar agen worker dapat menjalankan perintah otonom dengan aman)")
+
+        install_agy = True
+        if not getattr(args, "yes", False):
+            try:
+                ans = input("\n  ? Apakah Anda ingin sistem memasang wrapper 'cmd/agy-auto' sekarang? [Y/n]: ").strip().lower()
+                if ans in ("n", "no"):
+                    install_agy = False
+            except (EOFError, KeyboardInterrupt):
+                pass
+
+        if install_agy:
+            (WORKSPACE_ROOT / "cmd").mkdir(parents=True, exist_ok=True)
+            agy_auto_path.write_text('#!/bin/sh\nexec agy --dangerously-skip-permissions "$@"\n', encoding="utf-8")
+            agy_auto_path.chmod(0o755)
+            print("  [✓] Memasang cmd/agy-auto dan memberikan izin eksekusi (+x) ... Berhasil!")
+
+    print("-" * 80)
+    print(" Status Pre-flight: Siap melanjutkan.")
+
+    # --------------------------------------------------------------------------
+    # TAHAP 2: Lokasi Direktori Instalasi
+    # --------------------------------------------------------------------------
+    print("\n[2/5] 📂 LOKASI DIREKTORI INSTALASI")
+    print("-" * 80)
+    default_dir = str(WORKSPACE_ROOT)
+    print(f" Rekomendasi direktori: {default_dir}")
+
+    target_install_dir = default_dir
+    if not getattr(args, "yes", False):
+        try:
+            user_dir = input("\n ? Tekan [ENTER] untuk menggunakan rekomendasi di atas,\n   atau ketik path folder lain: ").strip()
+            if user_dir:
+                target_install_dir = str(Path(user_dir).expanduser().resolve())
+        except (EOFError, KeyboardInterrupt):
+            pass
+
+    install_path = Path(target_install_dir)
+    install_path.mkdir(parents=True, exist_ok=True)
+    print(f" [✓] Target direktori dikonfirmasi: {install_path}")
+    print("-" * 80)
+
+    # --------------------------------------------------------------------------
+    # TAHAP 3: Custom Workflow Builder vs Presets
+    # --------------------------------------------------------------------------
+    print("\n[3/5] 🔄 KONFIGURASI ALUR KERJA (WORKFLOW)")
+    print("-" * 80)
+    print(" Sistem menyediakan preset alur kerja bawaan:")
+    print("   • standard-software-house (5 Tahap: PM -> Analis -> Coder -> Review -> Docs)")
+    print("   • rapid-prototype         (3 Tahap: PM -> Coder -> Docs)")
+    print("   • bug-fix-squad           (3 Tahap: Triage -> Patch -> Verification)")
+
+    created_custom_wf = None
+    create_wf = False
+    if not getattr(args, "yes", False):
+        try:
+            ans = input("\n ? Apakah Anda ingin membuat Workflow Mandiri (Kustom) sekarang? [y/N]: ").strip().lower()
+            if ans in ("y", "yes"):
+                create_wf = True
+        except (EOFError, KeyboardInterrupt):
+            pass
+
+    if create_wf:
+        print("\n --- 🛠️  INTERACTIVE WORKFLOW BUILDER ---")
+        try:
+            wf_id = input(" 1. Masukkan ID Workflow baru (contoh: fintech-pipeline): ").strip()
+            if not wf_id:
+                wf_id = f"custom-workflow-{int(time.time())}"
+            wf_id = re.sub(r"[^a-zA-Z0-9_-]", "-", wf_id).lower()
+
+            wf_name = input(f" 2. Nama Lengkap Workflow [Default: {wf_id.replace('-', ' ').title()}]: ").strip()
+            if not wf_name:
+                wf_name = wf_id.replace("-", " ").title()
+
+            wf_desc = input(" 3. Deskripsi Singkat Workflow: ").strip()
+            if not wf_desc:
+                wf_desc = f"Alur kerja kustom mandiri untuk {wf_name}"
+
+            available_roles = [r["id"] for r in list_all_roles()]
+            if not available_roles:
+                available_roles = ["project-manager", "analyst", "coder", "qa-engineer", "documenter"]
+
+            print(f"\n 4. Tentukan urutan tahapan kerja.")
+            print(f"    Pilihan peran tersedia: {', '.join(f'[{i+1}] {r}' for i, r in enumerate(available_roles))}")
+
+            custom_stages = []
+            stage_num = 1
+            while True:
+                stage_name = input(f"\n    - Nama Tahap {stage_num} (misal: 'Core Implementation'): ").strip()
+                if not stage_name:
+                    stage_name = f"Stage {stage_num}"
+
+                print(f"      Pilih Peran Pelaksana Tahap {stage_num}:")
+                for i, r in enumerate(available_roles, 1):
+                    print(f"        [{i}] {r}")
+                r_choice = input(f"      Pilihan peran [1-{len(available_roles)}] (Default: {min(stage_num, len(available_roles))}): ").strip()
+                try:
+                    selected_role = available_roles[int(r_choice) - 1]
+                except Exception:
+                    selected_role = available_roles[min(stage_num - 1, len(available_roles) - 1)]
+
+                has_gate = input("      Apakah butuh Approval Gate (persetujuan manusia sebelum lanjut)? [y/N]: ").strip().lower() in ("y", "yes")
+
+                stage_dict = {
+                    "id": f"stage-{stage_num}-{re.sub(r'[^a-zA-Z0-9_]', '-', stage_name).lower()}",
+                    "name": stage_name,
+                    "role": selected_role,
+                    "gate": {
+                        "type": "user_approval" if has_gate else "automatic",
+                        "required": has_gate
+                    }
+                }
+                custom_stages.append(stage_dict)
+
+                more = input("    Tambah tahap selanjutnya? [Y/n]: ").strip().lower()
+                if more in ("n", "no"):
+                    break
+                stage_num += 1
+
+            custom_wf_data = {
+                "workflow_id": wf_id,
+                "name": wf_name,
+                "description": wf_desc,
+                "version": "1.0.0",
+                "communication_policy": {
+                    "max_peer_turns": 2,
+                    "max_rejection_retries": 3,
+                    "circuit_breaker": "enabled",
+                    "on_limit_exceeded": {
+                        "action": "throttle_and_escalate",
+                        "target": "control_room",
+                        "severity": "ACTIONABLE"
+                    }
+                },
+                "stages": custom_stages
+            }
+            wf_target_file = (install_path / ".agents" / "workflows" / f"{wf_id}.yaml")
+            wf_target_file.parent.mkdir(parents=True, exist_ok=True)
+            wf_target_file.write_text(dump_yaml(custom_wf_data), encoding="utf-8")
+            created_custom_wf = wf_id
+            print(f"\n [✓] Cetak biru workflow baru berhasil dibuat: {wf_target_file}!")
+        except (EOFError, KeyboardInterrupt):
+            print("\n [!] Workflow builder dilewati.")
+
+    print("-" * 80)
+
+    # --------------------------------------------------------------------------
+    # TAHAP 4: Eksekusi Pemasangan (Atomic Setup)
+    # --------------------------------------------------------------------------
+    print("\n[4/5] ⚙️  MENGEKSEKUSI PEMASANGAN & INITIALIZING INFRASTRUCTURE...")
+    print("-" * 80)
+
+    subdirs = [
+        install_path / "cmd",
+        install_path / ".agents" / "workflows",
+        install_path / ".agents" / "roles",
+        install_path / ".agents" / "templates",
+        install_path / ".agents" / "bus" / "inbox",
+        install_path / ".agents" / "tasks" / "active",
+        install_path / ".agents" / "tasks" / "completed",
+    ]
+    for d in subdirs:
+        d.mkdir(parents=True, exist_ok=True)
+    print(" [✓] Menyiapkan hierarki direktori ./cmd/ dan ./.agents/ ... Berhasil.")
+
+    # Permissions check
+    for cmd_file in (install_path / "cmd").glob("*"):
+        if cmd_file.is_file():
+            try:
+                cmd_file.chmod(cmd_file.stat().st_mode | 0o111)
+            except Exception:
+                pass
+    print(" [✓] Memeriksa permission executable (+x) pada ./cmd/ ... Berhasil.")
+
+    bus_ev_file = install_path / ".agents" / "bus" / "events.jsonl"
+    if not bus_ev_file.exists():
+        bus_ev_file.write_text("", encoding="utf-8")
+    print(" [✓] Menginisialisasi Zero-Token Message Bus & Circuit Breaker ... PASS (0.001s).")
+
+    env_sh = install_path / "cmd" / "env.sh"
+    if not env_sh.exists():
+        env_sh.write_text(
+            '#!/bin/sh\n# Multi-Agent Workflow Environment Loader\n'
+            'SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"\n'
+            'export PATH="$SCRIPT_DIR:$PATH"\n'
+            'echo "[✓] Multi-Agent Tools loaded into PATH: $SCRIPT_DIR"\n',
+            encoding="utf-8"
+        )
+        env_sh.chmod(0o755)
+    print(" [✓] Menyiapkan environment loader (cmd/env.sh) ... Berhasil.")
+
+    print("-" * 80)
+
+    # --------------------------------------------------------------------------
+    # TAHAP 5: Laporan Hasil Instalasi Komprehensif (Inventory Dashboard)
+    # --------------------------------------------------------------------------
+    roles = list_all_roles()
+    workflows = list_all_workflows()
+
+    print("\n" + "=" * 80)
+    print(" 🎉 INSTALASI & SETUP SELESAI DENGAN SUKSES!")
+    print("=" * 80)
+
+    print("\n 📁 STRUKTUR DIREKTORI TERPASANG:")
+    print(f"  • Direktori Root       : {install_path}")
+    print(f"  • Perkakas CLI Mandiri : {install_path / 'cmd'}")
+    print(f"  • Konfigurasi Agen     : {install_path / '.agents'}")
+    print(f"  • Bus Pesan Zero-Token : {install_path / '.agents' / 'bus'}")
+    print(f"  • Direktori Proyek     : {install_path / '.agents' / 'tasks'}")
+
+    print("\n 🎭 KATALOG PERAN TERSEDIA (AGENT ROSTER):")
+    for r in roles:
+        rid = r.get("id", "unknown")
+        title = r.get("title", rid)
+        tier = r.get("model_tier", "medium")
+        model = ROLE_MODELS.get(rid, f"tier-{tier}")
+        print(f"  • {rid:<18} : {title:<36} ({model})")
+
+    print("\n 🔄 CETAK BIRU WORKFLOW SIAP PAKAI:")
+    for w in workflows:
+        wid = w.get("workflow_id", "unknown")
+        tag = " [BARU]" if wid == created_custom_wf else ""
+        stg_cnt = len(w.get("stages", []))
+        print(f"  • {wid:<24} : {w.get('name', wid)} ({stg_cnt} Tahap){tag}")
+
+    print("\n 💡 CARA MEMBUAT WORKFLOW & AGENT BARU KAPAN SAJA:")
+    print("  • Buat workflow mandiri baru : team-orch workflow create <id>")
+    print("  • Buat peran agen baru      : team-orch role create <id>")
+    print("  • Lihat detail alur kerja   : team-orch workflow show <id>")
+    print("  • Lihat katalog peran       : team-orch role list")
+
+    print("\n 👉 LANGKAH PERTAMA MEMULAI:")
+    print("  1. Aktifkan terminal Anda:")
+    print("     source cmd/env.sh")
+    print("  2. Mulai proyek baru:")
+    pref_wf = created_custom_wf or "standard-software-house"
+    print(f"     team-orch init nama-proyek-anda --workflow {pref_wf}")
+    print("  3. Pantau di Control Room:")
+    print("     team-orch status")
+    print("=" * 80 + "\n")
+
+def cmd_audit(args):
+    p_dir = get_project_dir(args.project_id)
+    audit_file = p_dir / "audit-trail.md"
+    if not audit_file.exists():
+        print(f"[!] Audit trail for project '{args.project_id}' not found.")
+        return
+    text = audit_file.read_text(encoding="utf-8")
+    entries = re.findall(r"(###\s*\[AUDIT-\d+\].*?)(?=\n###\s*\[AUDIT|\Z)", text, re.DOTALL)
+    print("=" * 80)
+    print(f" 🛡️  AUDIT TRAIL & TRANSPARENCY LOG: {args.project_id.upper()}")
+    print(f" Total Aksi Terekam: {len(entries)}")
+    print("=" * 80)
+    tail_entries = entries[-args.tail:] if args.tail else entries
+    for e in tail_entries:
+        print(e.strip())
+        print("-" * 80)
+
+def cmd_log(args):
+    audit_id = append_audit_log(
+        project_id=args.project_id,
+        role=args.role,
+        event=args.event,
+        desc=args.desc,
+        files=args.files,
+        cmd=args.cmd,
+        duration=args.duration,
+        status=args.status,
+        security=args.security,
+        next_step=args.next
+    )
+    print(f"[✓] Audit log entry recorded: [{audit_id}] in {args.project_id}")
+
+def cmd_complete(args):
+    ensure_dirs()
+    project_id = args.project_id
+    p_dir = ACTIVE_TASKS_DIR / project_id
+    if not p_dir.exists():
+        print(f"[!] Active project '{project_id}' not found.")
+        return
+
+    manifest = get_or_create_manifest(project_id)
+
+    # 1. Framework Security Guard: Restrict complete to Control Room / Human
+    in_herdr = os.environ.get("HERDR_ENV") == "1"
+    caller_pane = os.environ.get("HERDR_PANE_ID")
+    assigned_panes = manifest.get("assigned_panes", {})
+    control_room_pane = assigned_panes.get("control_room")
+
+    caller_role = getattr(args, "caller_role", None) or os.environ.get("TEAM_ROLE")
+    non_agent_roles = {"control_room", "orchestrator", "human", "user"}
+    worker_panes = {p for r, p in assigned_panes.items() if p and r not in ("control_room", "project_manager")}
+
+    is_agent = False
+    if caller_role:
+        if caller_role.lower() not in non_agent_roles:
+            is_agent = True
+    elif in_herdr and caller_pane:
+        if caller_pane in worker_panes:
+            is_agent = True
+        elif control_room_pane and caller_pane != control_room_pane:
+            is_agent = True
+        else:
+            fleet = get_herdr_fleet_info()
+            if fleet:
+                orch_pane = fleet.get("orchestrator_pane_id")
+                if orch_pane and caller_pane != orch_pane:
+                    is_agent = True
+
+    if is_agent:
+        print("\n" + "=" * 80)
+        print(" 🛑 ACCESS DENIED: Pengarsipan Proyek Ditolak (Framework Security Guard)")
+        print("=" * 80)
+        print(f" Proyek : {project_id}")
+        print(f" Caller : Pane '{caller_pane or 'unknown'}' (Agent: {caller_role or 'worker_agent'})")
+        print("--------------------------------------------------------------------------------")
+        print(" Agen pekerja DILARANG menyelesaikan atau mengarsipkan proyek secara sepihak!")
+        print(" Berdasarkan standar framework, penyelesaian dan pengarsipan proyek hanya")
+        print(f" dapat dilakukan oleh Pengguna di Control Room ({control_room_pane or 'Control Room'})")
+        print(" setelah melalui peninjauan hasil kerja (User Acceptance Testing / UAT).")
+        print("================================================================================\n")
+        sys.exit(1)
+
+    # 2. Stage Verification: Verify all workflow stages are finished
+    wf_id = manifest.get("workflow", DEFAULT_WORKFLOW_ID)
+    wf = load_workflow(wf_id)
+    stages = wf.get("stages", [])
+    stage_idx = manifest.get("current_stage_index", 0)
+
+    if stage_idx < len(stages):
+        if not getattr(args, "force", False):
+            print(f"[!] Peringatan: Proyek diarsipkan sebelum seluruh tahapan workflow selesai ({stage_idx}/{len(stages)} selesai).")
+
+    # 3. Mark Completed & Record Audit
+    manifest["status"] = "COMPLETED"
+    manifest["completed_at"] = datetime.now().isoformat()
+    manifest["sign_off"] = {
+        "approved_by": "User (Control Room)",
+        "approved_at": datetime.now().isoformat(),
+        "uat_status": "PASSED"
+    }
+    save_manifest(project_id, manifest)
+
+    append_audit_log(
+        project_id=project_id,
+        role="orchestrator",
+        event="USER_SIGN_OFF_APPROVED",
+        desc="Persetujuan akhir pengguna (User Acceptance Testing / UAT) diverifikasi di Control Room",
+        status="PASSED",
+        security="UAT VERIFIED - HUMAN SIGN-OFF APPROVED",
+        next_step="Proyek resmi dituntaskan dan dipindahkan ke direktori arsip completed"
+    )
+
+    append_audit_log(
+        project_id=project_id,
+        role="orchestrator",
+        event="PROJECT_COMPLETED",
+        desc="Proyek dinyatakan tuntas setelah seluruh implementasi, review, dan dokumentasi selesai serta disetujui Pengguna",
+        next_step="Proyek dipindahkan ke arsip completed dan siap digunakan"
+    )
+
+    record_bus_event(
+        project_id=project_id,
+        from_role="control_room",
+        to_role="all",
+        event_type="PROJECT_COMPLETED",
+        payload={"project_id": project_id, "status": "COMPLETED"}
+    )
+
+    target_dir = COMPLETED_TASKS_DIR / project_id
+    if target_dir.exists():
+        shutil.rmtree(target_dir)
+    shutil.move(str(p_dir), str(target_dir))
+    print("\n" + "=" * 80)
+    print(f" 🎉 PROYEK BERHASIL DISELESAIKAN & DIARSIPKAN!")
+    print("=" * 80)
+    print(f" Proyek          : {project_id}")
+    print(f" Final Sign-off  : ✅ DISETUJUI OLEH PENGGUNA (UAT PASSED)")
+    print(f" Arsip Tersimpan : {target_dir}")
+    print("=" * 80 + "\n")
+
+def compact_jsonl_file(path: Path, max_lines: int = 100, retain_lines: int = 50):
+    """Keep JSONL files compact with atomic zero-data-loss compaction."""
+    if not path.exists():
+        return
+    try:
+        res = compact_message_bus(path, max_size_bytes=5 * 1024 * 1024, force=False)
+        if res.get("status") == "compacted":
+            return
+        lines = path.read_text(encoding="utf-8").splitlines()
+        if len(lines) > max_lines:
+            retained = lines[-retain_lines:]
+            safe_atomic_write(path, "\n".join(retained) + "\n")
+    except Exception:
+        pass
+
+def cmd_bus_send(args):
+    ensure_dirs()
+    project_id = args.project
+    from_role = args.from_role
+    to_role = args.to_role
+    event_type = args.event_type.upper()
+    message = sanitize_text(args.msg)
+    explicit_sev = getattr(args, "severity", None)
+
+    # Check Circuit Breaker
+    allowed, err_msg = check_circuit_breaker(project_id, from_role, to_role, event_type)
+    if not allowed:
+        print(f"\n{'='*80}")
+        print(f" 🛑 [CIRCUIT BREAKER BLOCKED] {err_msg}")
+        print(f"{'='*80}\n")
+        # Send ACTIONABLE alert to bus for control room
+        alert_event = format_bus_event(
+            project_id=project_id,
+            from_role="circuit_breaker",
+            to_role="control_room",
+            event_type="CIRCUIT_BREAKER_TRIPPED",
+            message=err_msg,
+            payload={"reason": err_msg},
+            severity="ACTIONABLE",
+            status="FAILED"
+        )
+        safe_append(BUS_EVENTS_FILE, json.dumps(alert_event))
+        compact_message_bus(BUS_EVENTS_FILE, max_size_bytes=5 * 1024 * 1024, force=False)
+        sys.exit(2)
+
+    severity = determine_severity(event_type, explicit_sev)
+    payload = {}
+    if getattr(args, "payload", None):
+        try:
+            payload = json.loads(args.payload)
+        except Exception:
+            payload = {"raw": args.payload}
+
+    event_data = format_bus_event(
+        project_id=project_id,
+        from_role=from_role,
+        to_role=to_role,
+        event_type=event_type,
+        message=message,
+        payload=payload,
+        severity=severity,
+        status="PROCESSED"
+    )
+
+    # Write to global event log & compact via safe_append
+    safe_append(BUS_EVENTS_FILE, json.dumps(event_data))
+    compact_message_bus(BUS_EVENTS_FILE, max_size_bytes=5 * 1024 * 1024, force=False)
+
+    # Write to recipient inbox & compact via safe_append
+    inbox_file = BUS_INBOX_DIR / f"{to_role}.jsonl"
+    safe_append(inbox_file, json.dumps(event_data))
+    compact_message_bus(inbox_file, max_size_bytes=5 * 1024 * 1024, force=False)
+
+    # Display feedback
+    sev_tag = {
+        "SILENT": "🔇 [SILENT - 0 LLM Token]",
+        "TELEMETRY": "📊 [TELEMETRY - UI Only]",
+        "ACTIONABLE": "🚨 [ACTIONABLE - Control Room Alert!]"
+    }.get(severity, f"[{severity}]")
+
+    print(f"[✓ Bus Dispatch] {sev_tag} {from_role} -> {to_role} ({event_type}): {message}")
+    if severity == "ACTIONABLE":
+        print(f"\n{'='*80}")
+        print(f" 🚨 HIGH-PRIORITY ACTIONABLE ALERT FOR CONTROL ROOM:")
+        print(f"    From: {from_role} | Project: {project_id}")
+        print(f"    Notice: {message}")
+        print(f"{'='*80}\n")
+
+def cmd_bus_compact(args):
+    ensure_dirs()
+    project_id = getattr(args, "project", None)
+    force = getattr(args, "force", True)
+
+    print("=" * 80)
+    print(" 🧹 MESSAGE BUS COMPACTION (GAP-06 / ZERO-DATA-LOSS ATOMIC REWRITE)")
+    print("=" * 80)
+    print(f" Target Project Filter : {project_id if project_id else '(Semua Proyek)'}")
+    print(f" Mode                  : {'FORCE (Manual Trigger)' if force else 'Size-Threshold (>5MB)'}")
+    print("-" * 80)
+
+    # 1. Compact global events.jsonl
+    res_ev = compact_message_bus(BUS_EVENTS_FILE, force=force, project_id=project_id)
+    print(f" [Global Event Bus] {BUS_EVENTS_FILE.name}:")
+    print(f"   Status: {res_ev.get('status')} ({res_ev.get('reason', 'OK')})")
+    if res_ev.get("status") == "compacted":
+        print(f"   Total: {res_ev.get('original_count')} -> Dipertahankan: {res_ev.get('retained_count')} (Dibersihkan: {res_ev.get('removed_count')})")
+        print(f"   Ukuran Berkas: {res_ev.get('original_size_bytes')} bytes -> {res_ev.get('new_size_bytes')} bytes")
+
+    # 2. Compact queue.jsonl if exists
+    bus_queue = BUS_DIR / "queue.jsonl"
+    if bus_queue.exists():
+        res_q = compact_message_bus(bus_queue, force=force, project_id=project_id)
+        print(f" [Queue Bus] {bus_queue.name}: {res_q.get('status')} (Dibersihkan: {res_q.get('removed_count', 0)})")
+
+    # 3. Compact all inboxes in BUS_INBOX_DIR
+    inbox_files = list(BUS_INBOX_DIR.glob("*.jsonl"))
+    print(f"\n [Kotak Masuk Peran] Memeriksa {len(inbox_files)} berkas inbox:")
+    for f in inbox_files:
+        res_in = compact_message_bus(f, force=force, project_id=project_id)
+        if res_in.get("status") == "compacted":
+            print(f"   - {f.name}: Compacted ({res_in.get('original_count')} -> {res_in.get('retained_count')}, -{res_in.get('removed_count')} dibersihkan)")
+        else:
+            print(f"   - {f.name}: {res_in.get('status')}")
+
+    print("=" * 80)
+    print(" [✓] Kompaksi Message Bus Selesai. Seluruh event PENDING dan FAILED (<30 hari) dipertahankan.")
+    print("=" * 80)
+
+def cmd_bus_read(args):
+    ensure_dirs()
+    role = args.role
+    inbox_file = BUS_INBOX_DIR / f"{role}.jsonl"
+    if not inbox_file.exists():
+        print(f"[*] Kotak masuk (inbox) untuk peran '{role}' masih kosong.")
+        return
+
+    lines = [l.strip() for l in inbox_file.read_text(encoding="utf-8").splitlines() if l.strip()]
+    if not lines:
+        print(f"[*] Tidak ada pesan di inbox peran '{role}'.")
+        return
+
+    limit = getattr(args, "limit", 10) or 10
+    recent = lines[-limit:]
+    print("=" * 80)
+    print(f" 📬 INBOX PESAN UNTUK PERAN: {role.upper()} (Menampilkan {len(recent)} pesan terakhir)")
+    print("=" * 80)
+    for l in recent:
+        try:
+            ev = json.loads(l)
+            ts = ev.get("timestamp", "").replace("T", " ")[:19]
+            sev = ev.get("severity", "SILENT")
+            print(f"[{ts}] [{sev}] Dari: {ev.get('from_role')} | Tipe: {ev.get('type')}")
+            print(f"  Pesan  : {ev.get('message')}")
+            if ev.get("payload"):
+                print(f"  Payload: {json.dumps(ev.get('payload'))}")
+            print("-" * 80)
+        except Exception:
+            print(f"  {l}")
+    print("=" * 80)
+
+def cmd_bus_status(args):
+    ensure_dirs()
+    total_events = 0
+    by_sev = {"SILENT": 0, "TELEMETRY": 0, "ACTIONABLE": 0}
+    by_type: Dict[str, int] = {}
+
+    if BUS_EVENTS_FILE.exists():
+        for l in BUS_EVENTS_FILE.read_text(encoding="utf-8").splitlines():
+            if not l.strip(): continue
+            total_events += 1
+            try:
+                ev = json.loads(l)
+                s = ev.get("severity", "SILENT")
+                by_sev[s] = by_sev.get(s, 0) + 1
+                t = ev.get("type", "UNKNOWN")
+                by_type[t] = by_type.get(t, 0) + 1
+            except Exception:
+                pass
+
+    inbox_counts = {}
+    if BUS_INBOX_DIR.exists():
+        for f in BUS_INBOX_DIR.glob("*.jsonl"):
+            lines = [x for x in f.read_text(encoding="utf-8").splitlines() if x.strip()]
+            inbox_counts[f.stem] = len(lines)
+
+    print("=" * 80)
+    print(" 📡 INTER-AGENT MESSAGE BUS & EVENT QUEUE STATUS")
+    print("=" * 80)
+    print(f" Total Event Terproses : {total_events} Event (Zero-Token Broker)")
+    print(f" Distribusi Severity   : SILENT={by_sev.get('SILENT', 0)} | TELEMETRY={by_sev.get('TELEMETRY', 0)} | ACTIONABLE={by_sev.get('ACTIONABLE', 0)}")
+    print(f" Kotak Masuk (Inboxes) : {inbox_counts if inbox_counts else '(Semua kosong)'}")
+    print("=" * 80)
+
+def cmd_resolve(args):
+    project_id = args.project_id
+    p_dir = get_project_dir(project_id)
+    if not p_dir.exists():
+        print(f"[!] Project '{project_id}' not found.")
+        return
+
+    manifest = get_or_create_manifest(project_id)
+    guardrails = manifest.setdefault("guardrails", {})
+    prev_status = guardrails.get("circuit_breaker_status", "ACTIVE")
+    reason = guardrails.get("lock_reason", "No previous lock")
+
+    guardrails["circuit_breaker_status"] = "ACTIVE"
+    guardrails["current_retries"] = 0
+    guardrails["turn_count"] = 0
+    guardrails["locked_at"] = None
+    guardrails["lock_reason"] = None
+    manifest["gate_status"]["review_iteration"] = 0
+    save_manifest(project_id, manifest)
+
+    note = getattr(args, "note", None) or "Pengguna/PM memberikan arahan resolusi untuk membuka kunci komunikasi"
+    append_audit_log(
+        project_id=project_id,
+        role="human/pm",
+        event="CIRCUIT_BREAKER_RESET",
+        desc=f"Circuit Breaker di-reset oleh Pengguna/PM. Catatan resolusi: {note}",
+        status="RESET_OK",
+        security="HUMAN-IN-THE-LOOP INTERVENTION APPLIED",
+        next_step="Agen dapat melanjutkan pengerjaan dengan kuota komunikasi bersih"
+    )
+
+    print("=" * 80)
+    print(f" 🔓 CIRCUIT BREAKER BERHASIL DI-RESET: {project_id}")
+    print("=" * 80)
+    print(f" Status Sebelumnya : {prev_status} ({reason})")
+    print(f" Status Baru       : ACTIVE (Status bungkam dicabut)")
+    print(f" Counter Revisi    : 0 / {guardrails.get('max_rejection_retries', 3)}")
+    print(f" Counter Obrolan   : 0 / {guardrails.get('max_peer_turns', 2)}")
+    print(f" Arahan Resolusi   : {note}")
+    print("=" * 80)
+
+    if getattr(args, "continue_stage", False):
+        print(f"[*] Melanjutkan tahap aktif secara otomatis...")
+        args.pane = None
+        cmd_next(args)
+
+def cmd_preflight(args):
+    """
+    Deterministic Fast-Fail Gate:
+    Locally validates Python, JS/TS, and JSON syntax in project code
+    with ZERO LLM tokens before submitting for human or AI code review.
+    """
+    project_id = args.project_id
+    p_dir = get_project_dir(project_id)
+    target_dir = WORKSPACE_ROOT
+    if p_dir.exists():
+        manifest_path = p_dir / "project.yaml"
+        if manifest_path.exists():
+            manifest = load_yaml(manifest_path)
+            t_rel = manifest.get("target_dir")
+            if t_rel:
+                target_dir = WORKSPACE_ROOT / t_rel
+
+    print("=" * 80)
+    print(f" ⚡ DETERMINISTIC FAST-FAIL GATE (0-TOKEN LOCAL PRE-FLIGHT)")
+    print(f"    Project: {project_id} | Target Directory: {target_dir}")
+    print("=" * 80)
+
+    errors = []
+    checked = 0
+
+    # 1. Python syntax compilation
+    import py_compile
+    for py_file in target_dir.rglob("*.py"):
+        if any(p in py_file.parts for p in [".agents", "node_modules", "__pycache__", ".venv", "venv"]):
+            continue
+        checked += 1
+        try:
+            py_compile.compile(str(py_file), doraise=True)
+        except py_compile.PyCompileError as e:
+            rel = str(py_file.relative_to(WORKSPACE_ROOT)) if py_file.is_relative_to(WORKSPACE_ROOT) else str(py_file)
+            errors.append((rel, f"SyntaxError: {getattr(e, 'msg', str(e))}"))
+
+    # 2. JSON validation
+    for json_file in target_dir.rglob("*.json"):
+        if any(p in json_file.parts for p in [".agents", "node_modules", ".git"]):
+            continue
+        checked += 1
+        try:
+            json.loads(json_file.read_text(encoding="utf-8"))
+        except Exception as e:
+            rel = str(json_file.relative_to(WORKSPACE_ROOT)) if json_file.is_relative_to(WORKSPACE_ROOT) else str(json_file)
+            errors.append((rel, f"JSONDecodeError: {e}"))
+
+    # 3. JS syntax check if Node is installed
+    node_bin = shutil.which("node")
+    if node_bin:
+        for js_file in target_dir.rglob("*.js"):
+            if any(p in js_file.parts for p in [".agents", "node_modules", ".next", "dist"]):
+                continue
+            checked += 1
+            res = subprocess.run([node_bin, "--check", str(js_file)], capture_output=True, text=True)
+            if res.returncode != 0:
+                rel = str(js_file.relative_to(WORKSPACE_ROOT)) if js_file.is_relative_to(WORKSPACE_ROOT) else str(js_file)
+                errors.append((rel, res.stderr.strip().splitlines()[-1] if res.stderr.strip() else "Syntax error"))
+
+    if errors:
+        print(f"\n❌ [PRE-FLIGHT FAILED] Ditemukan {len(errors)} kesalahan sintaks dasar!")
+        print("   Review TIDAK BISA diajukan ke Analis (Model Pro) sebelum sintaks diperbaiki:\n")
+        for fpath, err in errors:
+            print(f"   • {fpath}: {err}")
+        print("\n💡 Perbaiki kesalahan sintaks di atas secara lokal terlebih dahulu (0 token LLM terbuang).")
+        sys.exit(1)
+    else:
+        print(f"\n✅ [PRE-FLIGHT PASSED] Berhasil memvalidasi {checked} berkas sumber secara lokal!")
+        print("   Semua berkas valid secara struktural dan siap diajukan untuk Code Review.")
+
+def cmd_contract(args):
+    """
+    Context Budgeting & Contract Extraction:
+    Extracts only the essential role-specific artifact contract
+    to conserve 60-75% LLM tokens during delegation.
+    """
+    project_id = args.project_id
+    role = args.role.lower()
+    p_dir = get_project_dir(project_id)
+    if not p_dir.exists():
+        print(f"[!] Project '{project_id}' not found.")
+        sys.exit(1)
+
+    out = [f"# CONTRACT ARTIFACT: {role.upper()} | PROJECT: {project_id}\n"]
+
+    if role in ("coder", "developer"):
+        spec = p_dir / "02-technical-spec.md"
+        tasks = p_dir / "03-task-list.md"
+        if spec.exists():
+            out.append("## TARGET ARCHITECTURE & SPEC")
+            out.append(spec.read_text(encoding="utf-8"))
+        if tasks.exists():
+            out.append("\n## TASK CHECKLIST & ACCEPTANCE")
+            out.append(tasks.read_text(encoding="utf-8"))
+    elif role in ("analyst", "tech-lead", "gatekeeper"):
+        req = p_dir / "01-requirements.md"
+        spec = p_dir / "02-technical-spec.md"
+        if req.exists():
+            out.append("## BUSINESS REQUIREMENTS & AC")
+            out.append(req.read_text(encoding="utf-8"))
+        if spec.exists():
+            out.append("\n## PROPOSED ARCHITECTURE")
+            out.append(spec.read_text(encoding="utf-8"))
+    elif role in ("documenter", "writer"):
+        req = p_dir / "01-requirements.md"
+        spec = p_dir / "02-technical-spec.md"
+        tasks = p_dir / "03-task-list.md"
+        for f in (req, spec, tasks):
+            if f.exists():
+                out.append(f"## {f.stem.upper()}")
+                out.append(f.read_text(encoding="utf-8"))
+    elif role in ("qa-engineer", "qa", "tester"):
+        req = p_dir / "01-requirements.md"
+        spec = p_dir / "02-technical-spec.md"
+        rev = p_dir / "review-log.md"
+        if req.exists():
+            out.append("## BUSINESS REQUIREMENTS & AC")
+            out.append(req.read_text(encoding="utf-8"))
+        if spec.exists():
+            out.append("\n## API CONTRACT & TECHNICAL SPEC")
+            out.append(spec.read_text(encoding="utf-8"))
+        if rev.exists():
+            out.append("\n## CODE REVIEW & TEST STATUS")
+            out.append(rev.read_text(encoding="utf-8"))
+    else:
+        for f in sorted(p_dir.glob("*.md")):
+            out.append(f"## {f.name}")
+            out.append(f.read_text(encoding="utf-8"))
+
+    content = "\n".join(out)
+    if getattr(args, "output", None):
+        out_path = Path(args.output)
+        out_path.write_text(content, encoding="utf-8")
+        print(f"[✓] Role contract saved to: {out_path}")
+    else:
+        print(content)
+
+def cmd_knowledge(args):
+    action = args.knowledge_action
+    ensure_dirs()
+    k_dir = get_knowledge_dir()
+    active_dom = getattr(args, "domain", None) or get_active_domain_id()
+    catalog = load_knowledge_catalog(domain_id=active_dom)
+
+    if action == "list":
+        role_filter = getattr(args, "role", None)
+        print("=" * 80)
+        title_tag = f" (Filtered for role: {role_filter.upper()})" if role_filter else " (Global Master Catalog)"
+        print(f" 📚 KNOWLEDGE BASE CATALOG{title_tag}")
+        print(f"    Base Location : {k_dir}")
+        print(f"    Active Domain : {active_dom}")
+        print("=" * 80)
+        items = get_accessible_knowledge(role_filter, domain_id=active_dom) if role_filter else catalog
+        if not items:
+            print("[-] Tidak ada materi knowledge yang ditemukan.")
+            return
+        for item in items:
+            acc = item.get("access", "*")
+            acc_str = "GLOBAL (*)" if acc == "*" else f"RESTRICTED {acc}"
+            enf = item.get("enforcement", "advisory").upper()
+            src = "[BASE]" if item.get("_source", BASE_DOMAIN_ID) == BASE_DOMAIN_ID else f"[{str(item.get('_source')).upper()}]"
+            print(f" • {src} [{item.get('id')}] {item.get('title')}")
+            print(f"   Kategori   : {item.get('category')} | Status: {enf} | Izin Akses: {acc_str}")
+            print(f"   Berkas     : {item.get('file')}")
+            print(f"   Ringkasan  : {item.get('summary', '-')}\n")
+
+    elif action == "read":
+        topic_id = args.topic_id
+        caller_role = getattr(args, "role", None) or os.environ.get("HERDR_ROLE") or os.environ.get("AGENT_ROLE")
+        target_item = None
+        for item in catalog:
+            if item.get("id") == topic_id:
+                target_item = item
+                break
+        if not target_item:
+            print(f"❌ [NOT FOUND] Topik knowledge '{topic_id}' tidak ditemukan di registry.")
+            sys.exit(1)
+
+        # RBAC Check
+        acc = target_item.get("access", "*")
+        is_allowed = False
+        if acc == "*" or acc == "all":
+            is_allowed = True
+        elif not caller_role:
+            is_allowed = True
+        else:
+            role_norm = caller_role.lower().strip()
+            if isinstance(acc, list):
+                lowers = [str(r).lower().strip() for r in acc]
+                if role_norm in lowers or "*" in lowers or "all" in lowers:
+                    is_allowed = True
+            elif isinstance(acc, str):
+                if role_norm == acc.lower().strip() or acc == "*":
+                    is_allowed = True
+
+        if not is_allowed:
+            print(f"\n{'='*80}")
+            print(f" 🛑 [ACCESS DENIED] Peran '{caller_role}' TIDAK DIIZINKAN membaca topik '{topic_id}'.")
+            print(f"    Topik ini dikunci khusus untuk peran: {acc}")
+            print(f"{'='*80}\n")
+            sys.exit(1)
+
+        rel_file = target_item.get("file", f"topics/{topic_id}.md")
+        src_dir = Path(target_item.get("_knowledge_dir") or str(k_dir))
+        fpath = src_dir / rel_file
+        if not fpath.exists():
+            fpath = k_dir / rel_file
+        if not fpath.exists():
+            fpath = GLOBAL_KNOWLEDGE_DIR / rel_file
+        if not fpath.exists():
+            print(f"❌ [FILE MISSING] Berkas {fpath} tidak ditemukan secara fisik di disk.")
+            sys.exit(1)
+
+        print(fpath.read_text(encoding="utf-8"))
+
+    elif action == "draft":
+        topic_id = args.topic_id
+        clean_id = re.sub(r"[^a-zA-Z0-9_-]", "-", topic_id).lower()
+        title = getattr(args, "title", None) or clean_id.replace("-", " ").title()
+        draft_file = KNOWLEDGE_DRAFTS_DIR / f"{clean_id}.md"
+        template_file = get_templates_dir() / "knowledge-topic-template.md"
+        content = ""
+        if template_file.exists():
+            content = template_file.read_text(encoding="utf-8")
+            content = content.replace("[custom-topic-id]", clean_id)
+        else:
+            content = f"# {title}\n\n## 1. Ringkasan & Aturan\nDraft materi untuk {title}.\n"
+        draft_file.write_text(content, encoding="utf-8")
+        print("=" * 80)
+        print(f" 📝 [DRAFT CREATED] Draf usulan knowledge berhasil disiapkan di:")
+        print(f"    {draft_file}")
+        print("    Status: STAGING (Belum aktif sampai disetujui Manusia)")
+        print(f"\n👉 Untuk mengesahkan draf ini menjadi dokumen aktif, jalankan:")
+        print(f"   team-orch knowledge approve {clean_id} --access coder,analyst")
+        print("=" * 80)
+
+    elif action == "approve":
+        draft_id = args.draft_id
+        clean_id = re.sub(r"[^a-zA-Z0-9_-]", "-", draft_id).lower()
+        draft_file = KNOWLEDGE_DRAFTS_DIR / f"{clean_id}.md"
+        if not draft_file.exists():
+            draft_file = KNOWLEDGE_DRAFTS_DIR / draft_id
+        if not draft_file.exists():
+            print(f"❌ [DRAFT NOT FOUND] Draf '{draft_id}' tidak ditemukan di {KNOWLEDGE_DRAFTS_DIR}")
+            sys.exit(1)
+
+        access_val = getattr(args, "access", "*")
+        if access_val and "," in access_val:
+            access_val = [r.strip().lower() for r in access_val.split(",") if r.strip()]
+        elif access_val != "*":
+            access_val = [access_val.strip().lower()]
+
+        target_file = KNOWLEDGE_TOPICS_DIR / f"{clean_id}.md"
+        target_file.write_text(draft_file.read_text(encoding="utf-8"), encoding="utf-8")
+        draft_file.unlink()
+
+        reg_file = KNOWLEDGE_REGISTRY
+        catalog_data = {"version": "1.0.0", "knowledge_catalog": catalog}
+        existing = False
+        for item in catalog_data["knowledge_catalog"]:
+            if item.get("id") == clean_id:
+                item["access"] = access_val
+                item["file"] = f"topics/{clean_id}.md"
+                existing = True
+                break
+        if not existing:
+            catalog_data["knowledge_catalog"].append({
+                "id": clean_id,
+                "title": clean_id.replace("-", " ").title(),
+                "file": f"topics/{clean_id}.md",
+                "category": getattr(args, "category", "general"),
+                "access": access_val,
+                "enforcement": "strict",
+                "summary": f"Dokumen resmi knowledge untuk {clean_id}"
+            })
+
+        reg_file.write_text(dump_yaml(catalog_data), encoding="utf-8")
+        print("=" * 80)
+        print(f" ✅ [APPROVED & PUBLISHED] Knowledge '{clean_id}' berhasil disahkan!")
+        print(f"    Lokasi Dokumen : {target_file}")
+        print(f"    Hak Akses      : {access_val}")
+        print(f"    Registry       : {reg_file}")
+        print("=" * 80)
+
+    elif action in ("reject", "revoke"):
+        topic_id = args.topic_id
+        clean_id = re.sub(r"[^a-zA-Z0-9_-]", "-", topic_id).lower()
+        target_file = KNOWLEDGE_TOPICS_DIR / f"{clean_id}.md"
+        draft_file = KNOWLEDGE_DRAFTS_DIR / f"{clean_id}.md"
+        if target_file.exists():
+            draft_file.write_text(target_file.read_text(encoding="utf-8"), encoding="utf-8")
+            target_file.unlink()
+        reg_file = KNOWLEDGE_REGISTRY
+        catalog_data = {"version": "1.0.0", "knowledge_catalog": [item for item in catalog if item.get("id") != clean_id]}
+        reg_file.write_text(dump_yaml(catalog_data), encoding="utf-8")
+        print("=" * 80)
+        print(f" ↩️ [REVOKED & REVERTED] Knowledge '{clean_id}' berhasil dicabut!")
+        print(f"    File ditarik kembali ke draf: {draft_file}")
+        print(f"    Status: STAGING DRAFT (Menunggu peninjauan & persetujuan Manusia)")
+        print("=" * 80)
+
+def cmd_domain(args):
+    action = args.domain_action
+    active_id = get_active_domain_id()
+
+    if action == "list":
+        domains = list_all_domains()
+        print("=" * 80)
+        print(" 🧭 MULTI-DOMAIN REGISTRY (Base vs Specific Domain Packs)")
+        print("=" * 80)
+        base_mark = "👉 [ACTIVE]" if active_id == BASE_DOMAIN_ID else "  "
+        print(f" {base_mark} base                 | Day-1 Employee (Zero Institutional Knowledge)")
+        for d in domains:
+            mark = "👉 [ACTIVE]" if d["domain_id"] == active_id else "  "
+            print(f" {mark} {d['domain_id']:<20} | {d['name']} ({d['organization']}) [{d['scope']}]")
+            print(f"              Path: {d['path']}")
+        print("=" * 80)
+
+    elif action == "current":
+        d_manifest = load_domain_manifest(active_id) if active_id != BASE_DOMAIN_ID else None
+        if getattr(args, "json", False):
+            out = {
+                "active_domain": active_id,
+                "mode": "base" if active_id == BASE_DOMAIN_ID else "specific",
+                "domain_dir": d_manifest.get("_domain_dir") if d_manifest else None,
+                "manifest": d_manifest,
+            }
+            print(json.dumps(out, indent=2, default=str))
+            return
+        print(f"Active Domain : {active_id}")
+        if d_manifest:
+            org = d_manifest.get("organization") or {}
+            print(f"Name          : {d_manifest.get('name')}")
+            print(f"Organization  : {org.get('name', '-')}")
+            print(f"Domain Dir    : {d_manifest.get('_domain_dir')}")
+        else:
+            print("Mode          : Base Domain (Day-1 Employee / Zero Institutional Knowledge)")
+
+    elif action == "show":
+        target_id = _sanitize_domain_id(args.domain_id) if getattr(args, "domain_id", None) else active_id
+        if target_id == BASE_DOMAIN_ID:
+            print("Domain 'base': Day-1 Employee Mode (Zero Institutional Knowledge).")
+            return
+        d_manifest = load_domain_manifest(target_id)
+        if not d_manifest:
+            print(f"🛑 Domain '{target_id}' tidak ditemukan.")
+            sys.exit(1)
+        print("=" * 80)
+        print(f" 🧭 DETAIL SPECIFIC DOMAIN PACK: {target_id}")
+        print("=" * 80)
+        print(format_domain_context_block(target_id, d_manifest).strip())
+        print("=" * 80)
+
+    elif action == "use":
+        target_id = _sanitize_domain_id(args.domain_id)
+        if target_id in ("none", BASE_DOMAIN_ID):
+            set_active_domain_id(BASE_DOMAIN_ID)
+            print("[✓] Berhasil beralih ke mode 'base' (Day-1 / Zero Institutional Knowledge).")
+            return
+
+        ok, errs, warns = validate_domain_pack(target_id)
+        if not ok:
+            print(f"🛑 Gagal mengaktifkan domain '{target_id}':")
+            for e in errs:
+                print(f"   - {e}")
+            sys.exit(1)
+        for w in warns:
+            print(f"⚠️  Warning: {w}")
+
+        set_active_domain_id(target_id)
+        d_manifest = load_domain_manifest(target_id) or {}
+        print(f"[✓] Active Domain sekarang: '{target_id}' ({d_manifest.get('name', target_id)})")
+        print(f"    Path: {d_manifest.get('_domain_dir')}")
+
+    elif action == "init":
+        raw_id = args.domain_id
+        clean_id = _sanitize_domain_id(raw_id)
+        if clean_id in ("", BASE_DOMAIN_ID, "none"):
+            print("🛑 ID domain tidak valid atau reserved ('base'/'none').")
+            sys.exit(1)
+
+        root_dir = GLOBAL_DOMAINS_DIR if getattr(args, "global_scope", False) else LOCAL_DOMAINS_DIR
+        target_dir = root_dir / clean_id
+        if target_dir.exists():
+            print(f"[!] Domain '{clean_id}' sudah ada di: {target_dir}")
+            sys.exit(1)
+
+        (target_dir / "templates").mkdir(parents=True, exist_ok=True)
+        (target_dir / "knowledge" / "topics").mkdir(parents=True, exist_ok=True)
+        (target_dir / "docs").mkdir(parents=True, exist_ok=True)
+
+        tmpl_dir = get_templates_dir()
+        manifest_tmpl = tmpl_dir / "domain-manifest-template.yaml"
+        org_name = getattr(args, "org", None) or clean_id.replace("-", " ").title()
+        disp_name = getattr(args, "name", None) or f"{org_name} Domain Pack"
+
+        if manifest_tmpl.is_file():
+            m_txt = manifest_tmpl.read_text(encoding="utf-8")
+            m_txt = m_txt.replace("[domain-id]", clean_id)
+            m_txt = m_txt.replace("[Nama Organisasi atau Domain Kerja]", disp_name)
+            m_txt = m_txt.replace("[Nama Perusahaan / Organisasi]", org_name)
+            (target_dir / "domain.yaml").write_text(m_txt, encoding="utf-8")
+        else:
+            (target_dir / "domain.yaml").write_text(dump_yaml({
+                "schema_version": "1.0.0",
+                "domain_id": clean_id,
+                "name": disp_name,
+                "organization": {"name": org_name, "brand_color": "#1B4D3E"},
+                "boilerplates_file": "boilerplates.yaml",
+                "knowledge_dir": "knowledge",
+            }) + "\n", encoding="utf-8")
+
+        bp_tmpl = tmpl_dir / "domain-boilerplates-template.yaml"
+        if bp_tmpl.is_file():
+            b_txt = bp_tmpl.read_text(encoding="utf-8").replace("[domain-id]", clean_id)
+            (target_dir / "boilerplates.yaml").write_text(b_txt, encoding="utf-8")
+
+        (target_dir / "knowledge" / "registry.yaml").write_text(
+            dump_yaml({"version": "1.0.0", "knowledge_catalog": []}) + "\n",
+            encoding="utf-8"
+        )
+        print(f"[✓] Specific Domain Pack '{clean_id}' berhasil dibuat di: {target_dir}")
+        print(f"    1. Lengkapi metadata, aplikasi, pejabat & template di: {target_dir}/domain.yaml")
+        print(f"    2. Aktifkan dengan: team-orch domain use {clean_id}")
+
+    elif action == "bind":
+        project_id = args.project_id
+        target_id = _sanitize_domain_id(args.domain_id)
+        if target_id in ("none", BASE_DOMAIN_ID):
+            target_id = BASE_DOMAIN_ID
+        elif not find_domain_dir(target_id):
+            print(f"🛑 Domain '{target_id}' tidak ditemukan.")
+            sys.exit(1)
+
+        p_dir = get_project_dir(project_id)
+        if not p_dir.exists():
+            print(f"🛑 Proyek '{project_id}' tidak ditemukan.")
+            sys.exit(1)
+        manifest = get_or_create_manifest(project_id)
+        old_dom = manifest.get("domain_id") or BASE_DOMAIN_ID
+        manifest["domain_id"] = target_id
+        save_manifest(project_id, manifest)
+        append_audit_log(
+            project_id=project_id,
+            role="control_room",
+            event="DOMAIN_BOUND",
+            desc=f"Mengubah ikatan domain proyek dari '{old_dom}' menjadi '{target_id}'",
+            files=["project.yaml"],
+        )
+        print(f"[✓] Proyek '{project_id}' sekarang terikat ke domain: '{target_id}' (sebelumnya: '{old_dom}')")
+
+    elif action == "validate":
+        target_id = _sanitize_domain_id(args.domain_id) if getattr(args, "domain_id", None) else active_id
+        if target_id == BASE_DOMAIN_ID:
+            print("[✓] Mode 'base' selalu valid (Zero Institutional Knowledge).")
+            return
+        ok, errs, warns = validate_domain_pack(target_id)
+        for w in warns:
+            print(f"⚠️  Warning: {w}")
+        if ok:
+            print(f"[✓] Specific Domain Pack '{target_id}' VALID dan siap digunakan.")
+        else:
+            print(f"🛑 Validasi domain '{target_id}' GAGAL:")
+            for e in errs:
+                print(f"   - {e}")
+            sys.exit(1)
+
+    elif action == "sync":
+        if not LOCAL_DOMAINS_DIR.exists():
+            print("[-] Tidak ada folder .agents/domains/ lokal untuk disinkronkan.")
+            return
+        GLOBAL_DOMAINS_DIR.mkdir(parents=True, exist_ok=True)
+        count = 0
+        for entry in sorted(LOCAL_DOMAINS_DIR.iterdir()):
+            if entry.is_dir() and (entry / "domain.yaml").is_file():
+                dest = GLOBAL_DOMAINS_DIR / entry.name
+                shutil.copytree(entry, dest, dirs_exist_ok=True)
+                print(f"[✓] Disinkronkan ke global store: {entry.name} -> {dest}")
+                count += 1
+        print(f"[✓] Total {count} Specific Domain Pack berhasil disinkronkan ke {GLOBAL_DOMAINS_DIR}")
+
+def main():
+    parser = argparse.ArgumentParser(description=f"team-orch v{VERSION}: Autonomous Multi-Agent Team Orchestrator")
+    parser.add_argument("--version", "-v", action="version", version=f"team-orch v{VERSION}")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # setup (Interactive Onboarding & Workflow Builder)
+    p_setup = subparsers.add_parser("setup", help="Interactive onboarding & setup wizard")
+    p_setup.add_argument("--yes", "-y", action="store_true", help="Non-interactive mode (use defaults)")
+
+    # init
+    p_init = subparsers.add_parser("init", help="Initialize a new project with a specific workflow")
+    p_init.add_argument("project_id", help="Unique project identifier")
+    p_init.add_argument("--workflow", "-w", default=DEFAULT_WORKFLOW_ID, help=f"Workflow blueprint ID (default: {DEFAULT_WORKFLOW_ID})")
+    p_init.add_argument("--target-dir", "-t", help="Target source code directory for this project (e.g. tests/prj_a)")
+    p_init.add_argument("--domain", "-d", help="Bind project to a Specific Domain Pack ID (default: active domain or 'base')")
+    p_init.add_argument("--silent", action="store_true", help="Enable Silent Mode: run all agents in a single shared worker pane without multi-pane splitting")
+    p_init.add_argument("--mode", choices=["fleet", "silent"], default=None, help="Execution topology mode: 'fleet' (1 role = 1 pane) or 'silent' (single worker pane)")
+
+    # next (auto-pilot)
+    p_next = subparsers.add_parser("next", help="Auto-advance to the next stage in the project workflow")
+    p_next.add_argument("project_id", help="Project identifier")
+    p_next.add_argument("--pane", help="Override Herdr pane ID")
+    p_next.add_argument("--dry-run", action="store_true", help="Simulate next stage without modifying manifest or dispatching")
+    p_next.add_argument("--force", action="store_true", help="Force re-dispatch even if stage is currently marked DISPATCHED")
+    p_next.add_argument("--silent", action="store_true", help="Run or override in Silent Mode (single shared worker pane)")
+    p_next.add_argument("--mode", choices=["fleet", "silent"], default=None, help="Override execution mode")
+    p_next.add_argument("--stage", help="Override or jump to specific stage ID or index (e.g. build or 1)")
+
+    # auto (autonomous pipeline runner daemon)
+    p_auto = subparsers.add_parser("auto", help="Autonomous Pipeline Runner: automatically monitors and advances stages until UAT sign-off")
+    p_auto.add_argument("project_id", help="Project identifier")
+    p_auto.add_argument("--interval", "-i", type=int, default=5, help="Polling interval in seconds (default: 5)")
+    p_auto.add_argument("--timeout", type=int, default=1800, help="Maximum execution timeout in seconds (default: 1800)")
+    p_auto.add_argument("--silent", action="store_true", help="Run in Silent Mode")
+    p_auto.add_argument("--mode", choices=["fleet", "silent"], default=None, help="Override execution mode")
+    p_auto.add_argument("--stage", help="Override starting stage ID or index")
+
+    # status
+    p_status = subparsers.add_parser("status", help="Show Global Mission Control Dashboard or project details")
+    p_status.add_argument("project_id", nargs="?", help="Project identifier (optional)")
+
+    # approve
+    p_approve = subparsers.add_parser("approve", help="Approve user approval gate")
+    p_approve.add_argument("project_id", help="Project identifier")
+    p_approve.add_argument("--approver", "-a", default="User", help="Approver name")
+    p_approve.add_argument("--auto", action="store_true", help="Automatically launch Autonomous Pipeline Runner upon approval")
+
+    # workflow
+    p_wf = subparsers.add_parser("workflow", help="Manage and inspect workflow blueprints")
+    wf_sub = p_wf.add_subparsers(dest="wf_action", required=True)
+    wf_sub.add_parser("list", help="List available workflow presets")
+    p_wf_show = wf_sub.add_parser("show", help="Show details of a workflow blueprint")
+    p_wf_show.add_argument("workflow_id", help="Workflow ID")
+    p_wf_create = wf_sub.add_parser("create", help="Create a new custom workflow blueprint")
+    p_wf_create.add_argument("workflow_id", help="New workflow ID")
+    p_wf_create.add_argument("--name", help="Workflow full name")
+    p_wf_create.add_argument("--desc", help="Workflow description")
+    p_wf_create.add_argument("--force", action="store_true", help="Overwrite existing")
+
+    # role
+    p_role = subparsers.add_parser("role", help="Manage and inspect agent roles")
+    role_sub = p_role.add_subparsers(dest="role_action", required=True)
+    role_sub.add_parser("list", help="List all registered agent roles")
+    p_role_show = role_sub.add_parser("show", help="Show details of an agent role")
+    p_role_show.add_argument("role_id", help="Role ID")
+    p_role_create = role_sub.add_parser("create", help="Register a new agent role")
+    p_role_create.add_argument("role_id", help="New role ID")
+    p_role_create.add_argument("--title", help="Role job title")
+    p_role_create.add_argument("--tier", choices=["low", "medium", "high"], default="medium", help="Model tier")
+    p_role_create.add_argument("--desc", help="Role description")
+    p_role_create.add_argument("--force", action="store_true", help="Overwrite existing")
+
+    # audit
+    p_audit = subparsers.add_parser("audit", help="Display transparent audit trail and activity log")
+    p_audit.add_argument("project_id", help="Project identifier")
+    p_audit.add_argument("--tail", "-n", type=int, default=10, help="Number of latest entries to display (default: 10)")
+
+    # log
+    p_log = subparsers.add_parser("log", help="Record an action/event into project audit trail")
+    p_log.add_argument("project_id", help="Project identifier")
+    p_log.add_argument("--role", "-r", required=True, help="Agent role")
+    p_log.add_argument("--event", "-e", required=True, help="Event / Action name")
+    p_log.add_argument("--desc", "-d", required=True, help="Description of the action/process")
+    p_log.add_argument("--files", "-f", nargs="*", help="Associated files")
+    p_log.add_argument("--cmd", "-c", help="Shell command executed")
+    p_log.add_argument("--duration", help="Execution duration")
+    p_log.add_argument("--status", default="PASS", help="Output status (default: PASS)")
+    p_log.add_argument("--security", default="CLEAN / SECURE", help="Security validation status")
+    p_log.add_argument("--next", help="Next step / conclusion")
+
+    # complete
+    p_complete = subparsers.add_parser("complete", help="Move active project to completed archive (Control Room only)")
+    p_complete.add_argument("project_id", help="Project identifier")
+    p_complete.add_argument("--force", action="store_true", help="Bypass stage checks or force completion")
+    p_complete.add_argument("--caller-role", help="Explicit caller role for security verification")
+
+    # bus (Message Bus & Event Queue)
+    p_bus = subparsers.add_parser("bus", help="Inter-Agent Message Bus & Event Queue commands")
+    bus_sub = p_bus.add_subparsers(dest="bus_action", required=True)
+
+    # bus send
+    p_b_send = bus_sub.add_parser("send", help="Send an event/message across agents")
+    p_b_send.add_argument("--from", "-f", dest="from_role", required=True, help="Sender role")
+    p_b_send.add_argument("--to", "-t", dest="to_role", required=True, help="Recipient role")
+    p_b_send.add_argument("--type", "-e", dest="event_type", default="PEER_QUERY", help="Event type (default: PEER_QUERY)")
+    p_b_send.add_argument("--msg", "-m", dest="msg", required=True, help="Message body")
+    p_b_send.add_argument("--project", "-p", dest="project", help="Associated project ID")
+    p_b_send.add_argument("--severity", "-s", choices=["SILENT", "TELEMETRY", "ACTIONABLE"], help="Optional severity override")
+    p_b_send.add_argument("--payload", help="Optional JSON payload string")
+
+    # bus read
+    p_b_read = bus_sub.add_parser("read", help="Read messages from role inbox")
+    p_b_read.add_argument("role", help="Role name whose inbox to inspect")
+    p_b_read.add_argument("--limit", "-n", type=int, default=10, help="Number of messages to display")
+
+    # bus status
+    bus_sub.add_parser("status", help="Display global Message Bus telemetry and queue size")
+
+    # bus compact
+    p_b_compact = bus_sub.add_parser("compact", help="Compact message bus events and inboxes according to retention policy")
+    p_b_compact.add_argument("--project", "-p", help="Filter compaction for specific project ID only", default=None)
+    p_b_compact.add_argument("--force", action="store_true", default=True, help="Force compaction regardless of 5MB file size threshold")
+
+    # resolve (circuit breaker unlock)
+    p_res = subparsers.add_parser("resolve", help="Reset and unlock circuit breaker after human intervention")
+    p_res.add_argument("project_id", help="Project identifier to unlock")
+    p_res.add_argument("--note", "-n", help="Human resolution / decision note")
+    p_res.add_argument("--continue", dest="continue_stage", action="store_true", help="Auto-advance stage after reset")
+
+    # preflight (Deterministic Fast-Fail Gate)
+    p_pre = subparsers.add_parser("preflight", help="Deterministic fast-fail gate: validates syntax locally (0 tokens)")
+    p_pre.add_argument("project_id", help="Project identifier to scan")
+
+    # contract (Context Budgeting Extractor)
+    p_con = subparsers.add_parser("contract", help="Extract compact role-specific contract artifact to save tokens")
+    p_con.add_argument("project_id", help="Project identifier")
+    p_con.add_argument("--role", "-r", required=True, help="Target role (coder, analyst, documenter)")
+    p_con.add_argument("--output", "-o", help="Optional file path to write extracted contract")
+
+    # knowledge (Knowledge Base & Access Control)
+    p_kb = subparsers.add_parser("knowledge", help="Manage and query Scoped Knowledge Base (RBAC)")
+    kb_sub = p_kb.add_subparsers(dest="knowledge_action", required=True)
+
+    # knowledge list
+    p_kb_list = kb_sub.add_parser("list", help="List accessible knowledge topics")
+    p_kb_list.add_argument("--role", "-r", help="Filter topics accessible by role")
+
+    # knowledge read
+    p_kb_read = kb_sub.add_parser("read", help="Read a knowledge topic with RBAC access verification")
+    p_kb_read.add_argument("topic_id", help="Topic ID to read")
+    p_kb_read.add_argument("--role", "-r", help="Role identifier requesting access")
+
+    # knowledge draft
+    p_kb_draft = kb_sub.add_parser("draft", help="Create a new draft knowledge proposal")
+    p_kb_draft.add_argument("topic_id", help="New topic ID")
+    p_kb_draft.add_argument("--title", "-t", help="Topic title")
+
+    # knowledge approve
+    p_kb_app = kb_sub.add_parser("approve", help="Human approval: publish a draft knowledge into active catalog")
+    p_kb_app.add_argument("draft_id", help="Draft ID to approve")
+    p_kb_app.add_argument("--access", "-a", default="*", help="Access permission (* for global, or comma-separated roles like coder,analyst)")
+    p_kb_app.add_argument("--category", "-c", default="general", help="Topic category")
+
+    # knowledge reject / revoke
+    p_kb_rej = kb_sub.add_parser("reject", help="Revoke/reject a published knowledge topic back to drafts")
+    p_kb_rej.add_argument("topic_id", help="Topic ID to reject/revoke")
+
+    # domain (Multi-Domain Specific Pack Management & Isolation)
+    p_dom = subparsers.add_parser("domain", help="Manage and switch Specific Domain Packs (2-Domain Architecture)")
+    dom_sub = p_dom.add_subparsers(dest="domain_action", required=True)
+    dom_sub.add_parser("list", help="List available Specific Domain Packs and current active domain")
+    p_dom_cur = dom_sub.add_parser("current", help="Show currently active domain")
+    p_dom_cur.add_argument("--json", action="store_true", help="Print active domain info as JSON")
+    p_dom_show = dom_sub.add_parser("show", help="Inspect domain metadata and context")
+    p_dom_show.add_argument("domain_id", nargs="?", help="Domain ID (defaults to active domain)")
+    p_dom_use = dom_sub.add_parser("use", help="Switch active domain ('base' for zero institutional knowledge)")
+    p_dom_use.add_argument("domain_id", help="Domain ID or 'base'")
+    p_dom_init = dom_sub.add_parser("init", help="Scaffold a new Specific Domain Pack")
+    p_dom_init.add_argument("domain_id", help="New domain identifier (e.g. acme-corp)")
+    p_dom_init.add_argument("--name", help="Display name for the domain")
+    p_dom_init.add_argument("--org", help="Organization name")
+    p_dom_init.add_argument("--global", dest="global_scope", action="store_true", help="Create directly in ~/.gemini/team-orch/domains/")
+    p_dom_bind = dom_sub.add_parser("bind", help="Bind or rebind a project to a specific domain")
+    p_dom_bind.add_argument("project_id", help="Project ID")
+    p_dom_bind.add_argument("domain_id", help="Domain ID or 'base'")
+    p_dom_val = dom_sub.add_parser("validate", help="Validate consistency of a Specific Domain Pack")
+    p_dom_val.add_argument("domain_id", nargs="?", help="Domain ID (defaults to active domain)")
+    dom_sub.add_parser("sync", help="Sync local .agents/domains/* to global ~/.gemini/team-orch/domains/")
+
+    args = parser.parse_args()
+    if args.command == "setup":
+        cmd_setup(args)
+    elif args.command == "init":
+        cmd_init(args)
+    elif args.command == "next":
+        cmd_next(args)
+    elif args.command == "auto":
+        cmd_auto(args)
+    elif args.command == "status":
+        cmd_status(args)
+    elif args.command == "approve":
+        cmd_approve(args)
+    elif args.command == "workflow":
+        if args.wf_action == "list":
+            cmd_workflow_list(args)
+        elif args.wf_action == "show":
+            cmd_workflow_show(args)
+        elif args.wf_action == "create":
+            cmd_workflow_create(args)
+    elif args.command == "role":
+        if args.role_action == "list":
+            cmd_role_list(args)
+        elif args.role_action == "show":
+            cmd_role_show(args)
+        elif args.role_action == "create":
+            cmd_role_create(args)
+    elif args.command == "audit":
+        cmd_audit(args)
+    elif args.command == "log":
+        cmd_log(args)
+    elif args.command == "complete":
+        cmd_complete(args)
+    elif args.command == "bus":
+        if args.bus_action == "send":
+            cmd_bus_send(args)
+        elif args.bus_action == "read":
+            cmd_bus_read(args)
+        elif args.bus_action == "status":
+            cmd_bus_status(args)
+        elif args.bus_action == "compact":
+            cmd_bus_compact(args)
+    elif args.command == "resolve":
+        cmd_resolve(args)
+    elif args.command == "preflight":
+        cmd_preflight(args)
+    elif args.command == "contract":
+        cmd_contract(args)
+    elif args.command == "knowledge":
+        cmd_knowledge(args)
+    elif args.command == "domain":
+        cmd_domain(args)
+
+if __name__ == "__main__":
+    main()

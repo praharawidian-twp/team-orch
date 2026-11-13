@@ -1,0 +1,59 @@
+# ============================================================
+# Self-Improvement Framework — Runtime Configuration
+# ============================================================
+# Dikelola EKSKLUSIF oleh Manusia di Control Room.
+# AI DILARANG memodifikasi file ini secara langsung.
+#
+# Untuk memperbarui nilai threshold, gunakan perintah:
+#   team-orch self-improve config --set thresholds.rejections_per_task=3
+#
+# Referensi: .agents/tasks/active/self-improvement/02-technical-spec.md §1.3
+# ============================================================
+
+version: "1.0.0"
+enabled: true
+
+# Minimum siklus proyek yang harus selesai sebelum self-improvement
+# bisa berjalan kembali (Anti-Flood Guard)
+cooldown_cycles: 3
+
+thresholds:
+  # Trigger jika review ditolak >= N kali dalam 1 task
+  rejections_per_task: 2
+
+  # Trigger jika pola error identik muncul >= N kali lintas proyek
+  repeated_pattern_count: 3
+
+  # Trigger jika >= N% preflight gagal berturut-turut (0.0 - 1.0)
+  preflight_fail_rate: 0.4
+
+  # Trigger jika 1 stage membutuhkan waktu lebih dari N menit
+  bottleneck_stage_minutes: 60
+
+# Mapping otomatis dari kategori anomali ke jalur proposal
+routing_rules:
+  boilerplate_deviation:    knowledge_draft
+  missing_utility_tool:     meta_studio_mcp
+  role_confusion:           role_prompt_patch
+  repetitive_sop_gap:       skill_update
+  clean_code_violation:     knowledge_draft
+  missing_edge_case:        knowledge_draft
+  security_alert:           meta_studio_mcp
+
+# Konfigurasi model per tahap (sesuai Adaptive Model Tiering)
+model_tiering:
+  scan:     "none"               # 0-token — Python script deterministik
+  classify: "gemini-flash-low"   # Tier LOW — routing classification
+  draft:    "gemini-flash-high"  # Tier MEDIUM — proposal draft writing
+  arch:     "inherit"            # Tier HIGH — MCP/Skill architecture (Meta-Studio)
+
+# Path referensi framework
+paths:
+  signals_file:       ".agents/tasks/active/self-improvement/signals.json"
+  drafts_dir:         ".agents/knowledge/.drafts"
+  snapshots_dir:      ".agents/knowledge/.snapshots"
+  audit_trail:        ".agents/tasks/active/{project_id}/audit-trail.md"
+  review_log:         ".agents/tasks/active/{project_id}/review-log.md"
+  last_run_marker:    ".agents/tasks/active/self-improvement/.last-run"
+  constitutional:     ".agents/knowledge/topics/constitutional-immutables.md"
+  registry:           ".agents/knowledge/registry.yaml"

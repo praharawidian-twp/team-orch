@@ -1,0 +1,18 @@
+schema_version: "1.0.0"
+domain_id: "[domain-id]"
+guide_title: "Panduan & Standar Penggunaan Boilerplate"
+guide_topic_id: "boilerplate-guide"
+
+repositories:
+  - id: "backend"
+    name: "[Nama Boilerplate Backend]"
+    url: "https://github.com/org/backend-boilerplate.git"
+    type: "Backend Service"
+    branch_descriptions:
+      main: "Core Base Template"
+  - id: "frontend"
+    name: "[Nama Boilerplate Frontend]"
+    url: "https://github.com/org/frontend-boilerplate.git"
+    type: "Frontend Web App"
+    branch_descriptions:
+      main: "Core SPA Template"

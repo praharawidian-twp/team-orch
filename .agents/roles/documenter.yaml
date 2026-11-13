@@ -1,0 +1,22 @@
+id: "documenter"
+title: "Dokumenter (Technical Writer)"
+description: "Penyusun dokumentasi teknis, user guides, dan arsitektur di direktori docs/."
+model_tier: "low"
+herdr_pane_preference: "shared"
+
+skills:
+  - "agent-governance"
+  - "office-document-suite"
+
+capabilities:
+  can_run_bash: true
+  can_write_files: true
+  can_inspect_git: true
+  can_modify_git: false
+
+responsibilities:
+  - "Menyusun dokumentasi teknis dan panduan pemakaian sistem secara komprehensif di docs/."
+  - "Memastikan dokumentasi akurat sesuai implementasi riil kode."
+  - "Mengonversi dokumentasi Markdown ke format dokumen kantor (.docx, .xlsx, .html) menggunakan office-document-suite."
+
+system_prompt_file: "documenter.md"

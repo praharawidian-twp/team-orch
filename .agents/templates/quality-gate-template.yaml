@@ -1,0 +1,31 @@
+# ==============================================================================
+# 🛡️ QUALITY GATE POLICY TEMPLATE
+# ==============================================================================
+# File: .agents/templates/quality-gate-template.yaml
+# Deskripsi: Standar evaluasi dan kriteria kelulusan teknis sebelum serah terima.
+# ==============================================================================
+
+policy_id: "standard-engineering-gate"
+description: "Kebijakan verifikasi teknis ketat yang ditegakkan oleh Tech Lead / Analis."
+
+rules:
+  unit_test:
+    required: true
+    min_pass_rate_percent: 100       # Wajib 100% PASS tanpa toleransi gagal
+    allow_skipped_tests: false
+
+  code_quality:
+    enforce_clean_code: true
+    enforce_boilerplate_standard: true
+    single_responsibility_check: true
+
+  security:
+    zero_hardcoded_secrets: true
+    input_sanitization: true
+    safe_dependency_usage: true
+
+  git_policy:
+    read_only_strictly_enforced: true # Seluruh pemutasi git dilarang
+
+  review_loop:
+    max_retries: 3                   # Maksimal 3 kali loop revisi sebelum eskalasi ke PM

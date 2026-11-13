@@ -1,0 +1,131 @@
+workflow_id: "enterprise-sdlc-devops"
+name: "Enterprise SDLC with DevOps & QA Gate (8-Tier Full Delivery)"
+description: "Alur rekayasa perangkat lunak enterprise lengkap: PM (Scope) -> Analis (Arsitektur) -> Coder (Development) -> Analis (Code Review) -> DevOps (Containerization & Env) -> QA Engineer (4D Contract Validation Gate) -> Analis (Lead QA Scenario Audit & UAT Triage Gate) -> Dokumenter (Handoff & Runbook)."
+version: "1.2.0"
+
+communication_policy:
+  max_peer_turns: 2
+  max_rejection_retries: 3
+  circuit_breaker: "enabled"
+  on_limit_exceeded:
+    action: "throttle_and_escalate"
+    target: "control_room"
+    severity: "ACTIONABLE"
+
+stages:
+  - id: "requirement"
+    name: "Requirements & Scope Alignment"
+    role: "project-manager"
+    input_artifacts: []
+    output_artifacts:
+      - "01-requirements.md"
+    gate:
+      type: "user_approval"
+      required: true
+      description: "Menunggu tanda tangan / persetujuan pengguna (User Approval Gate) sebelum mulai arsitektur."
+
+  - id: "architecture"
+    name: "Boilerplate Audit & Technical Spec"
+    role: "analyst"
+    input_artifacts:
+      - "01-requirements.md"
+    output_artifacts:
+      - "02-technical-spec.md"
+      - "03-task-list.md"
+    gate:
+      type: "automatic"
+      required: false
+
+  - id: "development"
+    name: "Atomic Implementation & Unit Testing"
+    role: "coder"
+    input_artifacts:
+      - "02-technical-spec.md"
+      - "03-task-list.md"
+    output_artifacts:
+      - "review-log.md"
+    gate:
+      type: "automatic"
+      required: false
+
+  - id: "review"
+    name: "Gatekeeper Code Review & Security Audit"
+    role: "analyst"
+    input_artifacts:
+      - "01-requirements.md"
+      - "02-technical-spec.md"
+      - "review-log.md"
+    output_artifacts:
+      - "review-log.md"
+    gate:
+      type: "code_review"
+      required: true
+      on_reject:
+        loop_back_to: "development"
+        max_retries: 3
+        escalate_to: "project-manager"
+
+  - id: "devops"
+    name: "Containerization, Environment & CI/CD Setup"
+    role: "devops"
+    input_artifacts:
+      - "01-requirements.md"
+      - "02-technical-spec.md"
+      - "review-log.md"
+    output_artifacts:
+      - "compose.yaml"
+    gate:
+      type: "automatic"
+      required: false
+
+  - id: "qa-validation"
+    name: "Independent Runtime QA & Contract Validation Gate"
+    role: "qa-engineer"
+    input_artifacts:
+      - "01-requirements.md"
+      - "02-technical-spec.md"
+      - "review-log.md"
+    output_artifacts:
+      - "qa-test-report.md"
+    gate:
+      type: "code_review"
+      required: true
+      on_reject:
+        loop_back_to: "development"
+        max_retries: 3
+        escalate_to: "project-manager"
+
+  - id: "qa-review"
+    name: "Lead QA Scenario Audit & UAT Triage Gate"
+    role: "analyst"
+    input_artifacts:
+      - "01-requirements.md"
+      - "02-technical-spec.md"
+      - "qa-test-report.md"
+    output_artifacts:
+      - "qa-test-report.md"
+      - "review-log.md"
+    gate:
+      type: "code_review"
+      required: true
+      on_reject:
+        loop_back_to: "qa-validation"
+        max_retries: 3
+        escalate_to: "project-manager"
+
+  - id: "documentation"
+    name: "Knowledge Preservation & Operational Runbooks"
+    role: "documenter"
+    input_artifacts:
+      - "01-requirements.md"
+      - "02-technical-spec.md"
+      - "review-log.md"
+      - "qa-test-report.md"
+    output_artifacts:
+      - "docs/"
+    gate:
+      type: "automatic"
+      required: false
+
+# 📌 STANDAR FRAMEWORK: Setelah seluruh tahapan selesai, proyek otomatis masuk ke status READY_FOR_SIGN_OFF.
+# Pengarsipan hanya dapat dilakukan oleh Pengguna di Control Room melalui: team-orch complete <project_id>

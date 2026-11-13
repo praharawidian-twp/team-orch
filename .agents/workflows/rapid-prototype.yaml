@@ -1,0 +1,42 @@
+workflow_id: "rapid-prototype"
+name: "Rapid Prototyping Squad (Fast MVP)"
+description: "Alur cepat untuk pembuatan proof-of-concept atau MVP: PM (Scope) -> Coder (Direct Build) -> Dokumenter (Quick Notes)."
+version: "1.0.0"
+
+stages:
+  - id: "scope"
+    name: "Rapid Scope & Objective"
+    role: "project-manager"
+    input_artifacts: []
+    output_artifacts:
+      - "01-requirements.md"
+    gate:
+      type: "user_approval"
+      required: true
+      description: "Persetujuan singkat pengguna mengenai fitur inti MVP."
+
+  - id: "build"
+    name: "Fullstack Rapid Implementation"
+    role: "coder"
+    input_artifacts:
+      - "01-requirements.md"
+    output_artifacts:
+      - "review-log.md"
+    gate:
+      type: "automatic"
+      required: false
+
+  - id: "summary"
+    name: "MVP Demo Guide & Release Notes"
+    role: "documenter"
+    input_artifacts:
+      - "01-requirements.md"
+      - "review-log.md"
+    output_artifacts:
+      - "docs/README.md"
+    gate:
+      type: "automatic"
+      required: false
+
+# 📌 STANDAR FRAMEWORK: Setelah seluruh tahap selesai, proyek masuk ke READY_FOR_SIGN_OFF.
+# Pengarsipan hanya dapat dilakukan oleh Pengguna di Control Room via: team-orch complete <project_id>

@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+"""
+sync-boilerplates: Domain-Aware Boilerplate Discovery & Knowledge Synchronizer
+Mendeteksi branch/archetype baru di repositori Git boilerplate milik Specific Domain aktif
+dan menyinkronkan matriks katalognya ke Knowledge Base & Docs milik domain tersebut.
+"""
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+AGENT_ROOT = Path(__file__).resolve().parent.parent
+GLOBAL_TEAM_DIR = Path.home() / ".gemini" / "team-orch"
+GLOBAL_DOMAINS_DIR = GLOBAL_TEAM_DIR / "domains"
+GLOBAL_ACTIVE_DOMAIN_FILE = GLOBAL_TEAM_DIR / "active-domain.yaml"
+
+# Reuse lightweight YAML loader from team-orch if available in cmd/
+_CMD_DIR = Path(__file__).resolve().parent
+if str(_CMD_DIR) not in sys.path:
+    sys.path.insert(0, str(_CMD_DIR))
+
+
+def _load_yaml_simple(filepath: Path) -> Dict[str, Any]:
+    """Load YAML using PyYAML if installed, else fallback to team-orch pure-Python parser."""
+    try:
+        import yaml  # type: ignore
+        with open(filepath, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except ImportError:
+        import importlib.machinery
+        import importlib.util
+        to_path = _CMD_DIR / "team-orch"
+        loader = importlib.machinery.SourceFileLoader("team_orch_mod", str(to_path))
+        spec = importlib.util.spec_from_loader("team_orch_mod", loader)
+        if spec and spec.loader:
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod.load_yaml(filepath) or {}
+        return {}
+
+
+def resolve_active_domain(explicit_domain: Optional[str] = None) -> str:
+    if explicit_domain:
+        d = explicit_domain.strip().lower()
+        return "base" if d in ("", "none", "base") else re.sub(r"[^a-zA-Z0-9_-]", "-", d)
+    env_dom = os.environ.get("TEAM_ORCH_DOMAIN", "").strip().lower()
+    if env_dom:
+        return "base" if env_dom in ("", "none", "base") else re.sub(r"[^a-zA-Z0-9_-]", "-", env_dom)
+    if GLOBAL_ACTIVE_DOMAIN_FILE.is_file():
+        data = _load_yaml_simple(GLOBAL_ACTIVE_DOMAIN_FILE)
+        val = str(data.get("active_domain", "base")).strip().lower()
+        return "base" if val in ("", "none", "base") else re.sub(r"[^a-zA-Z0-9_-]", "-", val)
+    return "base"
+
+
+def find_domain_dir(domain_id: str) -> Optional[Path]:
+    if not domain_id or domain_id == "base":
+        return None
+    for root in (AGENT_ROOT / ".agents" / "domains", Path.cwd() / ".agents" / "domains", GLOBAL_DOMAINS_DIR):
+        cand = root / domain_id
+        if cand.is_dir() and (cand / "domain.yaml").is_file():
+            return cand
+    return None
+
+
+def get_remote_branches(repo_url: str) -> List[str]:
+    """Mendapatkan daftar branch aktif dari remote Git repository."""
+    try:
+        res = subprocess.run(
+            ["git", "ls-remote", "--heads", repo_url],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=True,
+        )
+        branches = []
+        for line in res.stdout.strip().splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].startswith("refs/heads/"):
+                branches.append(parts[1].replace("refs/heads/", ""))
+        return sorted(branches) if branches else ["main"]
+    except Exception as e:
+        print(f"[!] Warning: Gagal query remote {repo_url}: {e}", file=sys.stderr)
+        return ["main"]
+
+
+def generate_branch_matrix_markdown(repositories: List[Dict[str, Any]]) -> str:
+    """Menghasilkan teks tabel Markdown matriks branch untuk seluruh boilerplate domain."""
+    md = [
+        "### Matriks Cabang & Varian Template (Live Git Archetypes)",
+        "",
+        "Gunakan argumen `-b <branch>` saat `git clone` untuk mengambil varian arsitektur yang spesifik:",
+        "",
+    ]
+
+    for repo in repositories:
+        name = repo.get("name") or repo.get("id") or "Boilerplate"
+        url = repo.get("url", "")
+        if not url:
+            continue
+        desc_map = repo.get("branch_descriptions") or {}
+        branches = get_remote_branches(url)
+
+        md.append(f"#### {name}")
+        md.append(f"- **Git URL**: `{url}`")
+        if repo.get("type"):
+            md.append(f"- **Stack**: `{repo.get('type')}`")
+        md.append("")
+        md.append("| Branch | Status | Peruntukan & Karakteristik Arsitektur | Perintah Kloning Cepat |")
+        md.append("|---|---|---|---|")
+
+        for b in branches:
+            desc = desc_map.get(b, f"Arketipe khusus: varian {b}")
+            cmd = f"`git clone --depth 1 -b {b} {url} <target_dir>`"
+            md.append(f"| **`{b}`** | Active | {desc} | {cmd} |")
+
+        for planned_b, planned_desc in desc_map.items():
+            if planned_b not in branches:
+                cmd = f"`git clone --depth 1 -b {planned_b} {url} <target_dir>`"
+                md.append(f"| *`{planned_b}`* | Planned | {planned_desc} *(planned)* | {cmd} |")
+
+        md.append("")
+
+    return "\n".join(md)
+
+
+def update_file_matrix(file_path: Path, title: str, new_matrix: str) -> bool:
+    """Menyisipkan atau memperbarui blok matriks cabang di berkas target milik domain."""
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_start = "<!-- BEGIN_BOILERPLATE_BRANCH_MATRIX -->"
+    marker_end = "<!-- END_BOILERPLATE_BRANCH_MATRIX -->"
+    legacy_pattern = re.compile(
+        r"<!-- BEGIN_[A-Z0-9_]+_BRANCH_MATRIX -->.*?<!-- END_[A-Z0-9_]+_BRANCH_MATRIX -->",
+        re.DOTALL,
+    )
+    generic_pattern = re.compile(
+        rf"{re.escape(marker_start)}.*?{re.escape(marker_end)}",
+        re.DOTALL,
+    )
+    replacement_block = f"{marker_start}\n{new_matrix}\n{marker_end}"
+
+    if file_path.exists():
+        content = file_path.read_text(encoding="utf-8")
+        if generic_pattern.search(content):
+            updated = generic_pattern.sub(replacement_block, content)
+        elif legacy_pattern.search(content):
+            updated = legacy_pattern.sub(replacement_block, content)
+        else:
+            updated = content.rstrip() + f"\n\n---\n\n{replacement_block}\n"
+    else:
+        updated = f"# {title}\n\n{replacement_block}\n"
+
+    file_path.write_text(updated, encoding="utf-8")
+    return True
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Domain-Aware Boilerplate Discovery & Knowledge Synchronizer")
+    parser.add_argument("--domain", "-d", help="Specific Domain ID (defaults to active domain)")
+    args = parser.parse_args()
+
+    domain_id = resolve_active_domain(args.domain)
+    print("=" * 80)
+    print(f" 🔄 BOILERPLATE DISCOVERY & KNOWLEDGE SYNCHRONIZER (Domain: {domain_id})")
+    print("=" * 80)
+
+    if domain_id == "base":
+        print("[i] Mode aktif saat ini adalah 'base' (Zero Institutional Knowledge).")
+        print("    Tidak ada boilerplate spesifik perusahaan pada Base Domain.")
+        print("    Untuk menyinkronkan boilerplate organisasi, aktifkan Specific Domain:")
+        print("    -> team-orch domain use <domain_id>")
+        return
+
+    domain_dir = find_domain_dir(domain_id)
+    if not domain_dir:
+        print(f"🛑 Specific Domain '{domain_id}' tidak ditemukan.", file=sys.stderr)
+        sys.exit(1)
+
+    manifest = _load_yaml_simple(domain_dir / "domain.yaml")
+    bp_rel = manifest.get("boilerplates_file", "boilerplates.yaml")
+    bp_path = domain_dir / bp_rel
+    if not bp_path.is_file():
+        print(f"[i] Domain '{domain_id}' belum memiliki daftar boilerplate ({bp_path}).")
+        return
+
+    bp_data = _load_yaml_simple(bp_path)
+    repos = bp_data.get("repositories") or []
+    if not repos:
+        print(f"[i] Tidak ada repositori boilerplate terdaftar di {bp_path}.")
+        return
+
+    guide_topic_id = bp_data.get("guide_topic_id", "boilerplate-guide")
+    guide_title = bp_data.get("guide_title", f"Boilerplate Guide ({domain_id})")
+
+    k_rel = manifest.get("knowledge_dir", "knowledge")
+    topic_path = domain_dir / k_rel / "topics" / f"{guide_topic_id}.md"
+    docs_path = domain_dir / "docs" / f"{guide_topic_id}.md"
+
+    print(f" Menghubungi {len(repos)} repositori Git boilerplate domain '{domain_id}'...")
+    matrix_md = generate_branch_matrix_markdown(repos)
+
+    if update_file_matrix(topic_path, guide_title, matrix_md):
+        print(f"    ✓ Knowledge topic diperbarui : {topic_path}")
+    if update_file_matrix(docs_path, guide_title, matrix_md):
+        print(f"    ✓ Dokumentasi domain diperbarui : {docs_path}")
+
+    print("=" * 80)
+
+
+if __name__ == "__main__":
+    main()

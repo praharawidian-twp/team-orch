@@ -1,0 +1,84 @@
+# ==============================================================================
+# .gitignore - Autonomous Multi-Agent Engineering Framework
+# ==============================================================================
+
+# macOS System & Metadata Artifacts
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Windows & Linux System Files
+Thumbs.db
+Desktop.ini
+*~
+
+# Python Bytecode & Environments
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Node.js, Next.js & Web Build Outputs
+node_modules/
+.next/
+.turbo/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Databases & Local State
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# Antigravity & Multi-Agent Runtime Cache / Data
+.agents/tasks/
+.agents/bus/inbox/
+.agents/bus/events.jsonl
+.agents/knowledge/.drafts/
+.agents/domains/
+*.log
+
+# Meta-Studio Runtime & Local State (Core engine & blueprints are public)
+.agents/meta-studio/**/__pycache__/
+.agents/meta-studio/**/.env*
+.agents/meta-studio/.drafts/
+.agents/meta-studio/scratch/
+
+# Sandbox & Trial Folders (Uji Coba)
+tests/jastip_semeton/
+tests/prj_a/
+tests/prj_b/
+tests/test_repo/
+tests/__pycache__/
+sandbox/

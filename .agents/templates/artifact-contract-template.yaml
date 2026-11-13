@@ -1,0 +1,44 @@
+# ==============================================================================
+# 📑 ARTIFACT CONTRACT TEMPLATE
+# ==============================================================================
+# File: .agents/templates/artifact-contract-template.yaml
+# Deskripsi: Spesifikasi format baku artefak serah-terima antar peran.
+# ==============================================================================
+
+artifacts:
+  - id: "01-requirements.md"
+    producer: "project-manager"
+    consumer: ["analyst", "user"]
+    mandatory_sections:
+      - "Tujuan & Sasaran Bisnis (Goals)"
+      - "Lingkup Pekerjaan (In-Scope)"
+      - "Di Luar Lingkup (Out-of-Scope)"
+      - "Kriteria Penerimaan (Acceptance Criteria)"
+      - "Status Persetujuan Pengguna (Approval Gate)"
+
+  - id: "02-technical-spec.md"
+    producer: "analyst"
+    consumer: ["coder", "qa-engineer"]
+    mandatory_sections:
+      - "Ringkasan Arsitektur & Pola Desain"
+      - "Audit Boilerplate & Shared Utilities Eksisting"
+      - "Struktur Direktori & File Baru"
+      - "Kontrak API / Tipe Data / Interface"
+      - "Skenario Uji & Edge Cases Kritis"
+
+  - id: "03-task-list.md"
+    producer: "analyst"
+    consumer: ["coder", "project-manager"]
+    format: "checklist"
+    mandatory_sections:
+      - "Daftar Tugas Atomik (Task 1..N)"
+      - "Status Task ([ ] Belum, [x] Selesai)"
+
+  - id: "review-log.md"
+    producer: "analyst"
+    consumer: ["coder", "project-manager"]
+    mandatory_sections:
+      - "Status Keputusan (APPROVED / REVISE)"
+      - "Temuan Code Quality (Clean Code / SOLID)"
+      - "Temuan Keamanan (Security Audit)"
+      - "Verifikasi Test Coverage"

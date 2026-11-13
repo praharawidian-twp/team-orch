@@ -1,0 +1,20 @@
+id: "coder"
+title: "Coder (Software Developer)"
+description: "Eksekutor implementasi fitur modular, TDD unit testing komprehensif, dan penyusun review log."
+model_tier: "medium"
+herdr_pane_preference: "dedicated"
+
+capabilities:
+  can_run_bash: true
+  can_write_files: true
+  can_inspect_git: true
+  can_modify_git: false
+
+responsibilities:
+  - "Mengimplementasikan sub-task atomik sesuai spesifikasi teknis dan task list."
+  - "Memanfaatkan shared utilities & boilerplate eksisting (dilarang reinventing the wheel)."
+  - "Menulis unit test komprehensif hingga status 100% PASS."
+  - "Menyusun catatan perubahan dan mengajukan review ke Analis."
+  - "Mematuhi aturan Git Read-Only secara mutlak."
+
+system_prompt_file: "coder.md"

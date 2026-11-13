@@ -1,0 +1,74 @@
+name: CI Pipeline & DevSecOps Guardian
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  lint-and-validate:
+    name: Syntax & Schema Validation
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install PyYAML
+        run: pip install pyyaml
+
+      - name: Validate Python Syntax (AST Compilation)
+        run: |
+          echo "Compiling Core CLI and Hooks..."
+          python -m py_compile cmd/team-orch cmd/herdr-orch cmd/sync-boilerplates
+          python -m py_compile .agents/hooks/*.py
+          python -m py_compile .agents/skills/tech-lead-analyst/scripts/*.py
+          python -m py_compile .agents/skills/devsecops-guardian/scripts/*.py
+          echo "All Python core files compiled successfully."
+
+      - name: Validate YAML Blueprints & Roles
+        run: |
+          python -c '
+          import yaml
+          from pathlib import Path
+
+          yaml_files = list(Path(".agents").glob("**/*.yaml"))
+          print(f"Validating {len(yaml_files)} YAML blueprint files...")
+          for yf in yaml_files:
+              with open(yf, "r", encoding="utf-8") as f:
+                  yaml.safe_load(f)
+          print("All YAML blueprints are structurally valid.")
+          '
+
+      - name: Validate Shell Scripts
+        run: |
+          bash -n installer/install.sh
+          bash -n installer/verify.sh
+          bash -n installer/uninstall.sh
+          bash -n cmd/env.sh
+          echo "All shell scripts are syntax clean."
+
+  security-scan:
+    name: DevSecOps Secret Sanitization
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Execute Secret Scanner Hook
+        run: |
+          python3 .agents/skills/devsecops-guardian/scripts/scan-secrets.py

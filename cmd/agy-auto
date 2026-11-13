@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Autonomous non-interactive wrapper for Antigravity CLI
+exec agy --dangerously-skip-permissions "$@"

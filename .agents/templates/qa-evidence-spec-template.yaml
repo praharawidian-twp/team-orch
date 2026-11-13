@@ -1,0 +1,68 @@
+# Dynamic QA Evidence Specification & Contract Template
+# Standard contract defining mandatory artifacts per test case and presets.
+# Must be confirmed during Pre-QA Evidence Discovery Gate before execution.
+
+project_id: "<project_id>"
+version: "1.0.0"
+updated_at: "YYYY-MM-DD"
+human_confirmed: false
+confirmed_at: null
+
+# Active Preset: backend_api_standard | gateway_integration_sync | fullstack_ui_flow | custom_dynamic
+preset: "gateway_integration_sync"
+
+presets_catalog:
+  backend_api_standard:
+    description: "Pengujian REST API murni tanpa ketergantungan UI"
+    default_artifacts:
+      - "01-request-info.txt"
+      - "02-response-output.json"
+      - "03-verification-summary.txt"
+  gateway_integration_sync:
+    description: "Pengujian sinkronisasi API Gateway upstream & service lokal"
+    default_artifacts:
+      - "01-request-info.txt"
+      - "02-response-output.json"
+      - "03-verification-summary.txt"
+  fullstack_ui_flow:
+    description: "Pengujian antarmuka frontend lengkap dengan screenshot & session"
+    default_artifacts:
+      - "01-ui-screenshot.png"
+      - "capture-log.json"
+      - "02-dom-assertion.json"
+  custom_dynamic:
+    description: "Kombinasi custom berdasarkan kebutuhan tim"
+    default_artifacts: []
+
+# Default mandatory artifacts required across all standard test cases
+default_required_artifacts:
+  - "01-request-info.txt"
+  - "02-response-output.json"
+  - "03-verification-summary.txt"
+
+# Specific overrides for Test Cases that require visual or special evidence
+per_tc_overrides:
+  TC-15:
+    description: "Verifikasi Katalog API Gateway Upstream"
+    triage_category: "HUMAN_VALIDATION_REQUIRED"
+    requires_visual_ui: false # Set true only if ui_targets has ACTIVE url
+    required_artifacts:
+      - "01-upstream-api-catalog-view.json"
+      - "02-upstream-sync-status.txt"
+      - "03-verification-summary.txt"
+    optional_artifacts:
+      - "*.png"
+      - "capture-log.json"
+      - "README-EVIDENCE-GUIDE.txt"
+  TC-16:
+    description: "Pengesahan Bisnis Proses & Integrasi Downstream"
+    triage_category: "HUMAN_VALIDATION_REQUIRED"
+    requires_visual_ui: false
+    required_artifacts:
+      - "01-business-flow-verification.json"
+      - "02-downstream-ledger-status.txt"
+      - "03-verification-summary.txt"
+    optional_artifacts:
+      - "*.png"
+      - "capture-log.json"
+      - "README-EVIDENCE-GUIDE.txt"

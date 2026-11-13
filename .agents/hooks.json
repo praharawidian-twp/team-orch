@@ -1,0 +1,53 @@
+{
+  "herdr-autoswitch": {
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "python3 hooks/herdr-autoswitch.py",
+        "timeout": 5
+      }
+    ]
+  },
+  "knowledge-guardrail": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 hooks/knowledge-guardrail.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  },
+  "anti-assumption-guardrail": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 hooks/anti-assumption-guardrail.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  },
+  "secret-sanitizer": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 hooks/secret-sanitizer.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,83 @@
+workflow_id: "standard-software-house"
+name: "Standard Software House (5-Tier SDLC)"
+description: "Alur rekayasa perangkat lunak standar: PM (Scope) -> Analis (Architecture) -> Coder (Development) -> Analis (Review Loop) -> Dokumenter (Handoff)."
+version: "1.0.0"
+
+communication_policy:
+  max_peer_turns: 2             # Maksimal 2 putaran tanya-jawab antar agen dalam 1 sub-task
+  max_rejection_retries: 3      # Maksimal 3 kali revisi jika review ditolak
+  circuit_breaker: "enabled"
+  on_limit_exceeded:
+    action: "throttle_and_escalate"
+    target: "control_room"
+    severity: "ACTIONABLE"
+
+stages:
+  - id: "requirement"
+    name: "Requirements & Scope Alignment"
+    role: "project-manager"
+    input_artifacts: []
+    output_artifacts:
+      - "01-requirements.md"
+    gate:
+      type: "user_approval"
+      required: true
+      description: "Menunggu tanda tangan / persetujuan pengguna (User Approval Gate) sebelum mulai arsitektur."
+
+  - id: "architecture"
+    name: "Boilerplate Audit & Technical Spec"
+    role: "analyst"
+    input_artifacts:
+      - "01-requirements.md"
+    output_artifacts:
+      - "02-technical-spec.md"
+      - "03-task-list.md"
+    gate:
+      type: "automatic"
+      required: false
+
+  - id: "development"
+    name: "Atomic Implementation & Unit Testing"
+    role: "coder"
+    input_artifacts:
+      - "02-technical-spec.md"
+      - "03-task-list.md"
+    output_artifacts:
+      - "review-log.md"
+    gate:
+      type: "automatic"
+      required: false
+
+  - id: "review"
+    name: "Gatekeeper Code Review & Security Audit"
+    role: "analyst"
+    input_artifacts:
+      - "01-requirements.md"
+      - "02-technical-spec.md"
+      - "review-log.md"
+    output_artifacts:
+      - "review-log.md"
+    gate:
+      type: "code_review"
+      required: true
+      on_reject:
+        loop_back_to: "development"
+        max_retries: 3
+        escalate_to: "project-manager"
+
+  - id: "documentation"
+    name: "Knowledge Preservation & User Guides"
+    role: "documenter"
+    input_artifacts:
+      - "01-requirements.md"
+      - "02-technical-spec.md"
+      - "review-log.md"
+    output_artifacts:
+      - "docs/"
+    gate:
+      type: "automatic"
+      required: false
+
+# 📌 STANDAR FRAMEWORK: Setelah tahap documentation selesai, proyek otomatis masuk ke
+# status READY_FOR_SIGN_OFF. Pengarsipan hanya dapat dilakukan oleh Pengguna di Control Room
+# melalui perintah: team-orch complete <project_id>

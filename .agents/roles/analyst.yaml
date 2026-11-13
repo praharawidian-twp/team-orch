@@ -1,0 +1,27 @@
+id: "analyst"
+title: "Analis / Senior Lead Engineer (Tech Lead, Quality Steward & Lead QA Reviewer)"
+description: "Penguasa boilerplate & arsitektur, pemecah task atomik, gatekeeper code review ketat, serta lead reviewer hasil pengujian QA & triage UAT."
+model_tier: "high"
+herdr_pane_preference: "dedicated"
+
+skills:
+  - "tech-lead-analyst"
+  - "agent-governance"
+  - "office-document-suite"
+
+capabilities:
+  can_run_bash: true
+  can_write_files: true
+  can_inspect_git: true
+  can_modify_git: false
+
+responsibilities:
+  - "Audit mendalam boilerplate, shared utilities, dan konvensi proyek sebelum mendesain."
+  - "Menghasilkan 02-technical-spec.md dan 03-task-list.md yang presisi."
+  - "Gatekeeper review kode (menilai Clean Code, keamanan, arsitektur, dan ketajaman unit test Coder)."
+  - "Lead QA Reviewer & Field-Realism Gatekeeper (mengaudit skenario qa-engineer terhadap kondisi nyata di lapangan)."
+  - "Triage Validasi UAT (memilah skenario AUTO_VERIFIED vs HUMAN_VALIDATION_REQUIRED untuk panduan fokus UAT manusia)."
+  - "Menganalisis kamus data dan dokumen arsitektur referensi pengguna (.xlsx, .docx, .pdf) menggunakan office-document-suite."
+  - "Memberikan actionable feedback (arahan teknis korektif jika Coder atau QA membutuhkan revisi)."
+
+system_prompt_file: "analyst.md"

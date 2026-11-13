@@ -1,0 +1,45 @@
+schema_version: "1.0.0"
+domain_id: "[domain-id]"
+name: "[Nama Organisasi atau Domain Kerja]"
+description: "[Ringkasan konteks institusional, standar produk, dan aturan khusus domain]"
+version: "1.0.0"
+
+organization:
+  name: "[Nama Perusahaan / Organisasi]"
+  division: "[Nama Divisi / Squad / Unit]"
+  brand_color: "#1B4D3E"
+  confidentiality_notice: "[Catatan kerahasiaan resmi dokumen, opsional]"
+
+officials:
+  - role: "QA Manager"
+    name: "[Nama Pejabat QA]"
+    title: "QA Manager"
+  - role: "Department Head"
+    name: "[Nama Kepala Departemen]"
+    title: "Department Head"
+
+applications:
+  - id: "[app-id]"
+    name: "[Nama Aplikasi / Layanan]"
+    internal_domains:
+      - "https://app.internal.example"
+    notes: "[Deskripsi singkat layanan dan portal manajemennya]"
+
+templates:
+  qad_docx: "templates/official-qad-template.docx"
+  qa_report_md: "templates/qa-test-report-template.md"
+  external_reference_dir: ""
+  qa_matrix_columns:
+    - "Test ID"
+    - "Summary"
+    - "Description"
+    - "Test Type"
+    - "Gherkin Definition"
+    - "Cucumber Test Type"
+    - "Environment"
+    - "Expected Result"
+    - "Reporter"
+    - "Status Automation"
+
+boilerplates_file: "boilerplates.yaml"
+knowledge_dir: "knowledge"

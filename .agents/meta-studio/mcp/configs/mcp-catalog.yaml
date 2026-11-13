@@ -1,0 +1,4 @@
+version: "1.0.0"
+namespace: "meta-studio"
+description: "Katalog registrasi MCP Server hasil rancangan & konstruksi Meta-Studio"
+servers: []

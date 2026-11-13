@@ -1,0 +1,62 @@
+workflow_id: "meta-agent-evolution"
+name: "Meta-Agent Evolution & Capability Studio"
+description: "Alur rekayasa kapabilitas agen otonom: Meta-Architect (Analisis & Kontrak Schema) -> User Gate -> Meta-Architect (Desain Detail) -> Agent Builder (Konstruksi MCP/Skill/Tools) -> Meta-Architect (Security & Runtime Audit) -> Human Sign-off."
+version: "1.0.0"
+category: "meta-studio"
+
+communication_policy:
+  max_peer_turns: 3
+  max_rejection_retries: 3
+  circuit_breaker: "enabled"
+  on_limit_exceeded:
+    action: "throttle_and_escalate"
+    target: "control_room"
+    severity: "ACTIONABLE"
+
+stages:
+  - id: "capability_discovery"
+    name: "Capability Discovery & Requirement Alignment"
+    role: "meta-architect"
+    input_artifacts: []
+    output_artifacts:
+      - "01-capability-spec.md"
+    gate:
+      type: "user_approval"
+      required: true
+      description: "Menunggu persetujuan pengguna atas cakupan kapabilitas agen baru, pemilihan bentuk (MCP/Skill/Tool), dan batas keamanan sebelum mendesain."
+
+  - id: "architecture_design"
+    name: "Protocol Contract & Schema Architecture"
+    role: "meta-architect"
+    input_artifacts:
+      - "01-capability-spec.md"
+    output_artifacts:
+      - "02-meta-architecture.md"
+    gate:
+      type: "automatic"
+      required: false
+
+  - id: "tool_synthesis"
+    name: "MCP / Skill / Common Tooling Synthesis"
+    role: "agent-builder"
+    input_artifacts:
+      - "02-meta-architecture.md"
+    output_artifacts:
+      - "03-implementation-report.md"
+    gate:
+      type: "automatic"
+      required: false
+
+  - id: "verification_audit"
+    name: "Security Audit, Runtime Testing & Schema Validation"
+    role: "meta-architect"
+    input_artifacts:
+      - "01-capability-spec.md"
+      - "02-meta-architecture.md"
+      - "03-implementation-report.md"
+    output_artifacts:
+      - "04-verification-log.md"
+    gate:
+      type: "code_review"
+      required: true
+      description: "Meta-Architect memvalidasi kesesuaian schema, sanitasi input, ketiadaan kebocoran kredensial, dan stabilitas runtime."
