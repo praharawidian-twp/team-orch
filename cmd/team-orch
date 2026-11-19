@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-team-orch: Autonomous Multi-Agent Team Orchestrator (v1.1.0)
+team-orch: Autonomous Multi-Agent Team Orchestrator (v1.2.0)
 Manages dynamic virtual organization workflows, flexible agent roles, 
 declarative blueprints, artifact handoffs, and Herdr cross-pane orchestration.
 """
@@ -31,7 +31,17 @@ try:
         sanitize_text,
         compact_message_bus,
         format_bus_event,
-        SCHEMA_VERSION
+        SCHEMA_VERSION,
+        DEFAULT_ROLE_TIERS,
+        get_model_config_path,
+        load_model_config,
+        save_model_config,
+        resolve_model_for_tier,
+        resolve_role_tier_and_model,
+        sync_model_config_from_runtime,
+        set_tier_model_in_config,
+        add_api_key_model_to_config,
+        remove_api_key_model_from_config,
     )
 except ImportError:
     from cmd.comm_io import (
@@ -41,10 +51,20 @@ except ImportError:
         sanitize_text,
         compact_message_bus,
         format_bus_event,
-        SCHEMA_VERSION
+        SCHEMA_VERSION,
+        DEFAULT_ROLE_TIERS,
+        get_model_config_path,
+        load_model_config,
+        save_model_config,
+        resolve_model_for_tier,
+        resolve_role_tier_and_model,
+        sync_model_config_from_runtime,
+        set_tier_model_in_config,
+        add_api_key_model_to_config,
+        remove_api_key_model_from_config,
     )
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # ------------------------------------------------------------------------------
 # 1. Path & Workspace Discovery
@@ -662,24 +682,23 @@ def dump_yaml(data: Any, indent: int = 0) -> str:
     return "\n".join(l for l in lines if l is not None)
 
 # ------------------------------------------------------------------------------
-# 3. Model Tiers & Role Registry
+# 3. Model Tiers & Role Registry (Resolved Dynamically from .agents/config/models.yaml)
 # ------------------------------------------------------------------------------
 
-ROLE_MODELS = {
-    "pm": "gemini-3.8-flash-high",
-    "project-manager": "gemini-3.8-flash-high",
-    "analyst": "gemini-3.1-pro-high",
-    "analis": "gemini-3.1-pro-high",
-    "coder": "gemini-3.8-flash-high",
-    "dev": "gemini-3.8-flash-high",
-    "documenter": "gemini-3.8-flash-low",
-    "doc": "gemini-3.8-flash-low",
-    "qa-engineer": "gemini-3.8-flash-high",
-    "qa": "gemini-3.8-flash-high",
-    "devops": "gemini-3.8-flash-high",
-    "ops": "gemini-3.8-flash-high",
-    "infra": "gemini-3.8-flash-high",
-}
+def resolve_role_model(role_id: str, role_data: Optional[Dict[str, Any]] = None) -> Tuple[str, str]:
+    """Resolve (model_tier, concrete_model_id) dynamically from centralized models.yaml."""
+    return resolve_role_tier_and_model(role_id, role_data=role_data, workspace_root=WORKSPACE_ROOT)
+
+
+def get_role_models_map() -> Dict[str, str]:
+    """Compute current role -> model mapping dynamically from centralized config."""
+    return {
+        r_id: resolve_model_for_tier(tier, workspace_root=WORKSPACE_ROOT)
+        for r_id, tier in DEFAULT_ROLE_TIERS.items()
+    }
+
+
+ROLE_MODELS = get_role_models_map()
 
 def get_role_data(role_id: str) -> Dict[str, Any]:
     r_id = role_id.lower()
@@ -710,7 +729,7 @@ def get_role_data(role_id: str) -> Dict[str, Any]:
         return {
             "id": r_id_normalized,
             "title": title,
-            "model_tier": ROLE_MODELS.get(r_id_normalized, "medium"),
+            "model_tier": DEFAULT_ROLE_TIERS.get(r_id_normalized, "medium"),
             "description": f"Role {r_id_normalized} from markdown file",
             "system_prompt": content
         }
@@ -718,7 +737,7 @@ def get_role_data(role_id: str) -> Dict[str, Any]:
     return {
         "id": r_id_normalized,
         "title": r_id_normalized.capitalize(),
-        "model_tier": ROLE_MODELS.get(r_id_normalized, "medium"),
+        "model_tier": DEFAULT_ROLE_TIERS.get(r_id_normalized, "medium"),
         "description": "Dynamic role",
         "system_prompt": f"Anda bertindak sebagai {r_id_normalized}."
     }
@@ -935,9 +954,10 @@ def append_audit_log(project_id: str, role: str, event: str, desc: str, files: l
     audit_id = f"AUDIT-{next_idx:03d}"
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    _, actor_model = resolve_role_model(role)
     entry_lines = [
         f"\n### [{audit_id}] {now_str} | {role.upper()} | {event.upper()}",
-        f"- **Pelaksana (Actor)**: {role.capitalize()} (`{ROLE_MODELS.get(role.lower(), 'default')}`)",
+        f"- **Pelaksana (Actor)**: {role.capitalize()} (`{actor_model}`)",
         f"- **Tindakan / Proses**: {desc}",
     ]
     if files:
@@ -1593,13 +1613,9 @@ def cmd_next(args):
                 save_manifest(project_id, manifest)
                 return
 
-    # Determine Model & Worker Pane
+    # Determine Model & Worker Pane dynamically from role -> model_tier -> models.yaml
     r_data = get_role_data(role)
-    model = ROLE_MODELS.get(role.lower(), "gemini-3.8-flash-high")
-    if r_data.get("model_tier") == "high":
-        model = "gemini-3.1-pro-high"
-    elif r_data.get("model_tier") == "low":
-        model = "gemini-3.8-flash-low"
+    tier, model = resolve_role_model(role, r_data)
 
     ensure_agy_auto_installed()
 
@@ -1749,7 +1765,7 @@ def cmd_next(args):
                 print(f"[🔕 SILENT MODE] Mengirim sinyal pemicu handoff ke shared worker pane: {pane_id} (Peran: {role})")
             else:
                 print(f"[✓] Mengirim sinyal pemicu handoff ke dedicated worker pane: {pane_id}")
-            cmd = [herdr_bin, "delegate", pane_id, trigger_message, "--model", model, "--role", role, "--reset-on-role-change", "--allow-self"]
+            cmd = [herdr_bin, "delegate", pane_id, trigger_message, "--model", model, "--tier", tier, "--role", role, "--reset-on-role-change", "--allow-self"]
             subprocess.run(cmd)
 
             # Update manifest
@@ -2144,14 +2160,14 @@ def cmd_role_list(args):
     for r in roles:
         rid = r.get("id", "unknown")
         title = r.get("title", rid)
-        tier = r.get("model_tier", "medium")
-        model = ROLE_MODELS.get(rid, f"tier-{tier}")
+        tier, model = resolve_role_model(rid, r)
         desc = r.get("description", "")
         print(f"\n🔹 Role ID    : {rid}")
         print(f"   Jabatan    : {title}")
         print(f"   Model AI   : {model} (Tier: {tier})")
         print(f"   Tanggung Jawab : {desc}")
     print("\n" + "=" * 80)
+    print(f" Sumber Konfigurasi Model: {get_model_config_path(workspace_root=WORKSPACE_ROOT)}")
     print(" Cara pembuatan peran baru: Salin template .agents/templates/agent-role-template.yaml")
     print("=" * 80)
 
@@ -2162,8 +2178,7 @@ def cmd_role_show(args):
         return
     rid = r_data.get("id", args.role_id)
     title = r_data.get("title", rid)
-    tier = r_data.get("model_tier", "medium")
-    model = ROLE_MODELS.get(rid, f"tier-{tier}")
+    tier, model = resolve_role_model(rid, r_data)
     desc = r_data.get("description", "")
     print("=" * 80)
     print(f" 🎭 DETAIL PERAN AGEN: {title}")
@@ -2289,25 +2304,22 @@ def cmd_role_create(args):
         content = content.replace('model_tier: "medium"', f'model_tier: "{tier}"')
         target_file.write_text(content, encoding="utf-8")
     else:
-        model_name = "gemini-3.8-flash-high"
-        if tier == "high": model_name = "gemini-3.1-pro-high"
-        elif tier == "low": model_name = "gemini-3.8-flash-low"
         data = {
             "id": clean_id,
             "title": title,
             "description": desc,
             "model_tier": tier,
-            "recommended_model": model_name,
             "system_prompt": f"# Peran: {title}\nAnda bertanggung jawab atas {desc}.\n"
         }
         target_file.write_text(dump_yaml(data), encoding="utf-8")
 
+    resolved_model = resolve_model_for_tier(tier, workspace_root=WORKSPACE_ROOT)
     print("=" * 80)
     print(f" [✓] PERAN AGEN BARU BERHASIL DIDAFTARKAN!")
     print("=" * 80)
     print(f" Role ID   : {clean_id}")
     print(f" Jabatan   : {title}")
-    print(f" Model Tier: {tier}")
+    print(f" Model Tier: {tier} (-> {resolved_model} via models.yaml)")
     print(f" Lokasi    : {target_file}")
     print(f"\n👉 Peran ini kini dapat langsung digunakan di workflow mana pun.")
     print("=" * 80)
@@ -2507,6 +2519,7 @@ def cmd_setup(args):
 
     subdirs = [
         install_path / "cmd",
+        install_path / ".agents" / "config",
         install_path / ".agents" / "workflows",
         install_path / ".agents" / "roles",
         install_path / ".agents" / "templates",
@@ -2517,6 +2530,11 @@ def cmd_setup(args):
     for d in subdirs:
         d.mkdir(parents=True, exist_ok=True)
     print(" [✓] Menyiapkan hierarki direktori ./cmd/ dan ./.agents/ ... Berhasil.")
+
+    models_cfg_dest = install_path / ".agents" / "config" / "models.yaml"
+    if not models_cfg_dest.exists():
+        save_model_config(load_model_config(workspace_root=WORKSPACE_ROOT), target_path=models_cfg_dest)
+    print(f" [✓] Memastikan konfigurasi model terpusat ({models_cfg_dest}) ... Berhasil.")
 
     # Permissions check
     for cmd_file in (install_path / "cmd").glob("*"):
@@ -2567,9 +2585,8 @@ def cmd_setup(args):
     for r in roles:
         rid = r.get("id", "unknown")
         title = r.get("title", rid)
-        tier = r.get("model_tier", "medium")
-        model = ROLE_MODELS.get(rid, f"tier-{tier}")
-        print(f"  • {rid:<18} : {title:<36} ({model})")
+        tier, model = resolve_role_model(rid, r)
+        print(f"  • {rid:<18} : {title:<36} ({model} [Tier: {tier}])")
 
     print("\n 🔄 CETAK BIRU WORKFLOW SIAP PAKAI:")
     for w in workflows:
@@ -3549,6 +3566,99 @@ def cmd_domain(args):
                 count += 1
         print(f"[✓] Total {count} Specific Domain Pack berhasil disinkronkan ke {GLOBAL_DOMAINS_DIR}")
 
+
+def cmd_model(args):
+    """Kelola konfigurasi model terpusat (.agents/config/models.yaml)."""
+    act = args.model_action
+    if act == "show":
+        cfg = load_model_config(workspace_root=WORKSPACE_ROOT)
+        cfg_path = get_model_config_path(workspace_root=WORKSPACE_ROOT)
+        if getattr(args, "json", False):
+            print(json.dumps({
+                "status": "success",
+                "config_path": str(cfg_path),
+                "version": cfg.get("version"),
+                "last_synced": cfg.get("last_synced"),
+                "tiers": cfg.get("tiers"),
+                "available_models": cfg.get("available_models", []),
+                "api_key_models": cfg.get("api_key_models", []),
+            }, indent=2))
+            return
+        print("=" * 80)
+        print(" 🤖 KONFIGURASI MODEL TERPUSAT (CENTRALIZED MODEL TIERS)")
+        print("=" * 80)
+        print(f" • Sumber Config : {cfg_path}")
+        print(f" • Versi / Sync  : v{cfg.get('version', '2.0.0')} | Last Synced: {cfg.get('last_synced', '-')}")
+        print("\n 📊 Pemetaan Tier -> Model Aktif:")
+        for t in ("low", "medium", "high"):
+            td = cfg.get("tiers", {}).get(t, {})
+            print(f"   [{t.upper():<6}] Primary: {td.get('primary', '-'):<28} | Fallback: {td.get('fallback', '-')}")
+        avail = cfg.get("available_models", [])
+        api_m = cfg.get("api_key_models", [])
+        print(f"\n 🌐 Model Runtime (agy models) : {len(avail)} model terdaftar")
+        print(f" 🔑 Model API Key (BYOK)       : {len(api_m)} model kustom")
+        for m in api_m:
+            print(f"   - {m.get('id')} (tier={m.get('tier')}, provider={m.get('provider')}, env={m.get('api_key_env')})")
+        print("\n 💡 Tips:")
+        print("   • Perbarui otomatis dari 'agy models' : team-orch model sync")
+        print("   • Ubah model satu tier sekaligus      : team-orch model set-tier medium <model_id>")
+        print("   • Tambah model berbasis API Key       : team-orch model add-api <model_id> --tier high --provider google --api-key-env GEMINI_API_KEY")
+        print("=" * 80)
+
+    elif act == "sync":
+        res = sync_model_config_from_runtime(
+            auto_assign=not getattr(args, "no_auto_assign", False),
+            workspace_root=WORKSPACE_ROOT,
+            global_scope=getattr(args, "global_scope", False),
+        )
+        if getattr(args, "json", False) or res.get("status") != "success":
+            print(json.dumps(res, indent=2))
+            if res.get("status") != "success":
+                sys.exit(1)
+            return
+        print("=" * 80)
+        print(" 🔄 SINKRONISASI MODEL RUNTIME BERHASIL")
+        print("=" * 80)
+        print(f" • Config Disimpan : {res['config_path']}")
+        print(f" • Model Ditemukan : {res['discovered_count']} model")
+        for t, tinfo in res.get("tiers", {}).items():
+            print(f"   [{t.upper():<6}] Primary: {tinfo.get('primary')} | Fallback: {tinfo.get('fallback')}")
+        print("=" * 80)
+
+    elif act == "set-tier":
+        res = set_tier_model_in_config(
+            tier=args.tier,
+            primary_model=args.model,
+            fallback_model=getattr(args, "fallback", None),
+            effort=getattr(args, "effort", None),
+            workspace_root=WORKSPACE_ROOT,
+            global_scope=getattr(args, "global_scope", False),
+        )
+        print(json.dumps(res, indent=2))
+
+    elif act == "add-api":
+        res = add_api_key_model_to_config(
+            model_id=args.model_id,
+            tier=args.tier,
+            provider=args.provider,
+            api_key_env=args.api_key_env,
+            display_name=getattr(args, "display_name", None),
+            base_url=getattr(args, "base_url", None),
+            set_primary=getattr(args, "set_primary", False),
+            workspace_root=WORKSPACE_ROOT,
+            global_scope=getattr(args, "global_scope", False),
+        )
+        print(json.dumps(res, indent=2))
+
+    elif act == "remove-api":
+        res = remove_api_key_model_from_config(
+            model_id=args.model_id,
+            workspace_root=WORKSPACE_ROOT,
+            global_scope=getattr(args, "global_scope", False),
+        )
+        print(json.dumps(res, indent=2))
+
+
 def main():
     parser = argparse.ArgumentParser(description=f"team-orch v{VERSION}: Autonomous Multi-Agent Team Orchestrator")
     parser.add_argument("--version", "-v", action="version", version=f"team-orch v{VERSION}")
@@ -3739,6 +3849,34 @@ def main():
     p_dom_val.add_argument("domain_id", nargs="?", help="Domain ID (defaults to active domain)")
     dom_sub.add_parser("sync", help="Sync local .agents/domains/* to global ~/.gemini/team-orch/domains/")
 
+    # model (Centralized Model Config & Dynamic Tier Resolution)
+    p_mod = subparsers.add_parser("model", help="Manage centralized model tiers, runtime sync, and API-key models")
+    mod_sub = p_mod.add_subparsers(dest="model_action", required=True)
+    p_mod_show = mod_sub.add_parser("show", help="Show centralized tier-to-model mapping and registered models")
+    p_mod_show.add_argument("--json", action="store_true", help="Output raw JSON")
+    p_mod_sync = mod_sub.add_parser("sync", help="Sync available models from 'agy models' and auto-assign newest generations")
+    p_mod_sync.add_argument("--no-auto-assign", action="store_true", help="Only refresh available_models without changing tier primaries")
+    p_mod_sync.add_argument("--global", dest="global_scope", action="store_true", help="Write to global ~/.gemini/team-orch/config/models.yaml")
+    p_mod_sync.add_argument("--json", action="store_true", help="Output raw JSON")
+    p_mod_set = mod_sub.add_parser("set-tier", help="Update target model for a tier (automatically applies to all roles using that tier)")
+    p_mod_set.add_argument("tier", choices=["low", "medium", "high"], help="Target tier")
+    p_mod_set.add_argument("model", help="Primary model ID")
+    p_mod_set.add_argument("--fallback", help="Optional fallback model ID")
+    p_mod_set.add_argument("--effort", choices=["low", "medium", "high", "xhigh"], help="Optional reasoning effort")
+    p_mod_set.add_argument("--global", dest="global_scope", action="store_true", help="Write to global config")
+    p_mod_add = mod_sub.add_parser("add-api", help="Register a custom API-key (BYOK) model without storing raw keys")
+    p_mod_add.add_argument("model_id", help="Model ID (e.g. gemini-2.5-pro or gpt-5)")
+    p_mod_add.add_argument("--tier", choices=["low", "medium", "high"], required=True, help="Target tier")
+    p_mod_add.add_argument("--provider", required=True, help="Provider name (google, openai, anthropic, openrouter, etc.)")
+    p_mod_add.add_argument("--api-key-env", required=True, help="Environment variable name holding the API key")
+    p_mod_add.add_argument("--display-name", help="Optional display name")
+    p_mod_add.add_argument("--base-url", help="Optional custom API base URL")
+    p_mod_add.add_argument("--set-primary", action="store_true", help="Also set this model as primary for the chosen tier")
+    p_mod_add.add_argument("--global", dest="global_scope", action="store_true", help="Write to global config")
+    p_mod_rm = mod_sub.add_parser("remove-api", help="Remove a registered API-key model")
+    p_mod_rm.add_argument("model_id", help="Model ID to remove")
+    p_mod_rm.add_argument("--global", dest="global_scope", action="store_true", help="Write to global config")
+
     args = parser.parse_args()
     if args.command == "setup":
         cmd_setup(args)
@@ -3791,6 +3929,8 @@ def main():
         cmd_knowledge(args)
     elif args.command == "domain":
         cmd_domain(args)
+    elif args.command == "model":
+        cmd_model(args)
 
 if __name__ == "__main__":
     main()

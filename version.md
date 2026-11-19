@@ -1,23 +1,36 @@
 # Document Version & Release History
 
-**Version Saat Ini** : `v0.4.0`  
-**Tanggal Rilis**    : `2026-10-09`  
-**Deskripsi Singkat** : Rilis besar arsitektur enterprise multi-agent: penegakan tata kelola agen (*Agent Governance & Stirring Matrix*), sistem pertahanan kredensial (*DevSecOps Guardian*), standar kepemimpinan teknis Analis (*Tech Lead Analyst Protocol*), guardrail anti-asumsi (*Discovery-First Protocol*), serta otomatisasi pipa eksekusi (*Autonomous Pipeline Runner*).
+**Version Saat Ini** : `v1.2.0`  
+**Tanggal Rilis**    : `2026-11-19`  
+**Deskripsi Singkat** : Implementasi Konfigurasi Model Terpusat (`.agents/config/models.yaml`), resolusi dinamis `role -> model_tier -> models.yaml -> worker`, *auto-sync* model runtime dari `agy models` (termasuk dukungan otomatis generasi `gemini-4-neon-*`, `gemini-4-hydrogen-*`, `gemini-4-argon-*`, dan generasi masa depan), serta dukungan pendaftaran model kustom berbasis API Key (BYOK) tanpa menyimpan rahasia plaintext.
 
 ### List Fitur yang Berjalan di Versi Ini:
-1. **Agent Governance & Stirring Matrix**: Pembatasan hak akses baca/tulis/perbarui agen berdasarkan zona direktori, kedaulatan mutlak manusia pada Knowledge Base (*Zero Self-Approval*), dan kesetaraan konteks manusia (*Human-Context Parity*).
-2. **DevSecOps Guardian & Secret Sanitizer**: Intersepsi otomatis pada PreToolUse Hook untuk memblokir pembacaan file sensitif (`.env`, `~/.ssh/*`, `~/.aws/*`, `~/.kube/config`) dan pencegahan eksekusi perintah dump environment (`env`, `export`, dll).
-3. **Tech Lead Analyst Quality Protocol**: Standar peran Analis sebagai Senior Lead Engineer (Dekomposisi C4 Model, template ADR resmi, audit kepatuhan boilerplate, rubrik evaluasi review 5 dimensi *beyond green tests*, serta skrip validator `verify-spec.py`).
-4. **Anti-Assumption & Discovery-First Protocol**: PreToolUse Guardrail fisik yang menolak penyusunan PRD (`01-requirements.md`) tanpa transkrip wawancara kebutuhan langsung (*Discovery Log*) dan referensi basis boilerplate resmi.
-5. **Standard 3-Step Project Inception Protocol**: Alur interaktif terstruktur bertahap (Pemilihan Workflow $\rightarrow$ Pemilihan Topologi Fleet/Silent $\rightarrow$ Discovery Wawancara).
-6. **Autonomous Pipeline Runner (`team-orch auto`)**: Daemon mandiri untuk memantau, memverifikasi kelengkapan artefak, dan mengalirkan transisi tahap secara otonom hingga batas gerbang UAT.
-7. **Knowledge Revocation & Staging Gate**: Sub-perintah `team-orch knowledge reject/revoke` untuk mencabut atau mengembalikan topik knowledge ke draf staging jika tidak disetujui manusia.
-8. **DevOps & Infrastructure Role**: Penambahan peran `devops` dan workflow baru `enterprise-sdlc-devops` (6 tahap: PM $\rightarrow$ Analis $\rightarrow$ Coder $\rightarrow$ Analis $\rightarrow$ DevOps $\rightarrow$ Dokumenter).
-9. **Dynamic Stage Override & Revision Rollback (`--stage`)**: Kemampuan melompat atau mengembalikan pipa ke tahap sebelumnya (misal: pengembalian ke Coder saat terdapat revisi dari Pengguna) dengan opsi `--stage <id_or_index>`.
+1. **Centralized Model Configuration (`.agents/config/models.yaml` v2.0.0)**: Satu sumber kebenaran (*Single Source of Truth*) untuk pemetaan tier (`low`, `medium`, `high`) ke model AI aktif, sehingga file role (`.yaml` & `.md`) hanya cukup mengatur `model_tier` tanpa *hardcode* versi model.
+2. **Dynamic Runtime Sync (`team-orch model sync` & `herdr-orch model-config sync`)**: Membaca daftar model langsung dari `agy models`, memeringkat generasi dan sub-keluarga model terbaru secara otomatis (misal *auto-upgrade* tier `medium` ke `gemini-4-neon-high`), dan menerapkannya ke seluruh role serta pekerja berikutnya.
+3. **Custom API Key (BYOK) Model Registry**: Penambahan dan penghapusan model berbasis API Key (`add-api` / `remove-api`) dengan referensi variabel lingkungan (`api_key_env`) yang patuh terhadap prinsip DevSecOps.
+4. **Sequential Worker Model Switching (`herdr-orch` v0.5.0)**: Perpindahan pekerja lintas role (`--reset-on-role-change` / `team-orch next`) otomatis membaca tier role berikutnya dari `models.yaml` dan menerapkan `/new` + `/model <target>` secara dinamis.
+5. **Agent Governance, 2-Domain Isolation, Tech Lead & QA Validation Gate**: Seluruh kapabilitas versi sebelumnya (`v1.1.0`, `v1.0.0`, `v0.4.0`) tetap berjalan penuh dengan 76 unit test lulus 100%.
 
 ---
 
 ## History Versi
+
+### # version 1.2.0
+- **Tanggal Edit**: `2026-11-19`
+- **Deskripsi Singkat**: Rilis Konfigurasi Model Terpusat (`.agents/config/models.yaml`), sinkronisasi otomatis runtime `agy models` (`gemini-4-neon-*`), dan dukungan model API Key (BYOK).
+- **Tabel Rincian Perubahan**:
+
+| Berkas / Direktori | Jenis Perubahan | Alasan / Informasi Konteks | Impact ke Versi Sebelumnya | Kategori / Keamanan |
+| :--- | :--- | :--- | :--- | :--- |
+| `.agents/config/models.yaml` | Upgrade (`v2.0.0`) | Menjadi satu konfigurasi terpusat pemetaan tier (`low`, `medium`, `high`), katalog 23 `available_models` runtime, dan `api_key_models`. | Perubahan model cukup di 1 file tanpa mengedit ratusan file role `.yaml` / `.md`. | Architecture / Config |
+| `cmd/comm_io.py` | Tambah Engine Model | Menambahkan parser/dumper YAML-JSON terpusat, `resolve_role_tier_and_model`, `sync_model_config_from_runtime`, `score_and_classify_model`, `set_tier_model_in_config`, dan `add/remove_api_key_model`. | Menyatukan logika resolusi & pemeringkatan generasi model di seluruh CLI (`team-orch` & `herdr-orch`). | Core Engine / DevSecOps |
+| `cmd/herdr-orch` | Upgrade (`v0.5.0`) | Membaca tier dinamis dari `models.yaml`, deteksi TUI dinamis (`detect_model_from_snippet`), dukungan `--tier` & transisi role otomatis di `delegate_task`, serta subcommand `model-config`. | Pekerja berikutnya otomatis menerapkan `/model` sesuai tier role dari konfigurasi terpusat. | Orchestrator CLI |
+| `cmd/team-orch` | Upgrade (`v1.2.0`) | Menghapus `ROLE_MODELS` hardcode, memakai `resolve_role_model()`, dan menambahkan subcommand `team-orch model <show\|sync\|set-tier\|add-api\|remove-api>`. | Seluruh katalog role, audit log, dan stage dispatch selalu selaras dengan `models.yaml`. | Team Orchestrator CLI |
+| `.agents/roles/*.md` & `templates/agent-role-template.yaml` | Modifikasi | Menghapus hardcode nama model spesifik dan merujuk penuh ke `model_tier` (`low`/`medium`/`high`) via `.agents/config/models.yaml`. | Menghilangkan beban perawatan manual pada definisi role saat ada rilis model baru. | Role Configuration |
+| `.agents/skills/herdr-orchestrator/SKILL.md` & `installer/install.sh` | Modifikasi | Memperbarui dokumentasi CLI `model-config` / `team-orch model` dan menyalin `.agents/config/` serta `cmd/comm_io.py` saat instalasi global. | Memastikan instalasi bersih otomatis menyertakan engine & konfigurasi model terpusat. | Installer / Docs |
+| `tests/test_centralized_model_config.py` | Berkas Baru | Menambahkan 6 unit test (resolusi tier, `set-tier`, ranking generasi baru, registrasi BYOK API key, transisi pekerja beruntun, dan validasi update `gemini-4-neon`). | Verifikasi deterministik 76/76 unit test lulus tanpa regresi. | Automated Testing |
+
+---
 
 ### # version 0.4.0
 - **Tanggal Edit**: `2026-10-09`

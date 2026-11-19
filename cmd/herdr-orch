@@ -25,7 +25,36 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "0.4.0"
+_cmd_dir = Path(__file__).resolve().parent
+if str(_cmd_dir) not in sys.path:
+    sys.path.insert(0, str(_cmd_dir))
+
+try:
+    from comm_io import (
+        add_api_key_model_to_config,
+        get_model_config_path,
+        get_model_runtime_spec,
+        load_model_config,
+        remove_api_key_model_from_config,
+        resolve_model_for_tier,
+        resolve_role_tier_and_model,
+        set_tier_model_in_config,
+        sync_model_config_from_runtime,
+    )
+except ImportError:
+    from cmd.comm_io import (
+        add_api_key_model_to_config,
+        get_model_config_path,
+        get_model_runtime_spec,
+        load_model_config,
+        remove_api_key_model_from_config,
+        resolve_model_for_tier,
+        resolve_role_tier_and_model,
+        set_tier_model_in_config,
+        sync_model_config_from_runtime,
+    )
+
+VERSION = "0.5.0"
 
 def find_workspace_root() -> Path:
     cwd = Path.cwd().resolve()
@@ -87,36 +116,33 @@ BLOCKED_PATTERNS = [
     r"Yes, run command",
 ]
 
-# Model recommendations per complexity tier
-MODEL_TIERS = {
-    "low": {
-        "tier": "low",
-        "label": "Simple / Light",
-        "agy_model": "gemini-3.8-flash-low",
-        "effort": "low",
-        "subagent_model": "flash_lite",
-        "token_economy": "Maximum token savings (~80-90% quota preserved)",
-        "description": "Fast lookups, file grep, linting, simple regex, single unit test run, status checks."
-    },
-    "medium": {
-        "tier": "medium",
-        "label": "Moderate / Standard",
-        "agy_model": "gemini-3.8-flash-high",
-        "effort": "medium",
-        "subagent_model": "flash",
-        "token_economy": "Balanced high accuracy and token efficiency",
-        "description": "Feature implementation, bug fixing, multi-file code review, standard refactoring."
-    },
-    "high": {
-        "tier": "high",
-        "label": "Complex / High-Reasoning",
-        "agy_model": "gemini-3.1-pro-high",
-        "effort": "high",
-        "subagent_model": "pro",
-        "token_economy": "Premium reasoning quota (use sparingly for difficult tasks)",
-        "description": "Deep architecture design, complex algorithms, multi-system integration, security audits."
+# Dynamic model recommendations per complexity tier (resolved from centralized models.yaml)
+def get_dynamic_model_tiers() -> Dict[str, Dict[str, Any]]:
+    ws = find_workspace_root()
+    cfg = load_model_config(workspace_root=ws)
+    tiers_cfg = cfg.get("tiers", {})
+    defaults = {
+        "low": ("Simple / Light", "low", "flash_lite"),
+        "medium": ("Moderate / Standard", "medium", "flash"),
+        "high": ("Complex / High-Reasoning", "high", "pro"),
     }
-}
+    out: Dict[str, Dict[str, Any]] = {}
+    for tier_name, (def_label, def_effort, def_sub) in defaults.items():
+        t_data = tiers_cfg.get(tier_name, {})
+        out[tier_name] = {
+            "tier": tier_name,
+            "label": t_data.get("label", def_label),
+            "agy_model": t_data.get("primary"),
+            "fallback_model": t_data.get("fallback"),
+            "effort": t_data.get("effort", def_effort),
+            "subagent_model": t_data.get("subagent_model", def_sub),
+            "token_economy": t_data.get("token_economy", ""),
+            "description": t_data.get("description", ""),
+        }
+    return out
+
+
+MODEL_TIERS = get_dynamic_model_tiers()
 
 LOW_COMPLEXITY_KEYWORDS = [
     "find", "search", "grep", "read", "view", "cat", "ls", "status", "git status",
@@ -202,10 +228,25 @@ def save_pane_state(state: Dict[str, Any]) -> None:
 
 
 def detect_model_from_snippet(snippet: str) -> Optional[str]:
-    """Detect active model from screen status bar/TUI snippet."""
+    """Detect active model from screen status bar/TUI snippet using centralized config + legacy fallback."""
     if not snippet:
         return None
     lower_s = snippet.lower()
+    try:
+        cfg = load_model_config(workspace_root=find_workspace_root())
+        candidates = list(cfg.get("available_models", [])) + list(cfg.get("api_key_models", []))
+        for item in sorted(candidates, key=lambda x: len(str(x.get("display_name") or x.get("id") or "")), reverse=True):
+            mid = str(item.get("id", "")).strip()
+            disp = str(item.get("display_name", "")).strip()
+            if mid and mid.lower() in lower_s:
+                return mid
+            if disp:
+                disp_low = disp.lower()
+                tui_dot = re.sub(r"\s*\(([^)]+)\)", r" · \1", disp_low)
+                if disp_low in lower_s or tui_dot in lower_s:
+                    return mid
+    except Exception:
+        pass
     if "flash · low" in lower_s or "flash (low)" in lower_s or "flash-low" in lower_s:
         return "gemini-3.8-flash-low"
     if "flash · high" in lower_s or "flash (high)" in lower_s or "flash-high" in lower_s:
@@ -286,16 +327,18 @@ def reset_pane(target_pane: str) -> Dict[str, Any]:
 
 
 def switch_pane_model(target_pane: str, model: str) -> Dict[str, Any]:
-    """Manually send /model <model> to switch active model on target pane."""
-    code, stdout, stderr = send_slash_command(target_pane, f"/model {model}")
+    """Manually send /model <model> to switch active model on target pane (supports tier names)."""
+    ws = find_workspace_root()
+    resolved_model = resolve_model_for_tier(model, workspace_root=ws) if str(model).strip().lower() in ("low", "medium", "high") else model
+    code, stdout, stderr = send_slash_command(target_pane, f"/model {resolved_model}")
     if code != 0:
         return {"status": "error", "pane_id": target_pane, "error": stderr or stdout}
     state = load_pane_state()
     if target_pane not in state:
         state[target_pane] = {}
-    state[target_pane]["active_model"] = model
+    state[target_pane]["active_model"] = resolved_model
     save_pane_state(state)
-    return {"status": "success", "pane_id": target_pane, "action": "switch-model", "model": model}
+    return {"status": "success", "pane_id": target_pane, "action": "switch-model", "model": resolved_model}
 
 
 def check_pane_rate_limit(pane_id: str, lines: int = 80) -> Dict[str, Any]:
@@ -375,9 +418,11 @@ def classify_task_complexity(task_text: str) -> Dict[str, Any]:
             tier = "medium"
             reason = "Standard development task with balanced complexity."
 
-    rec = MODEL_TIERS[tier].copy()
+    tiers_map = get_dynamic_model_tiers()
+    rec = tiers_map[tier].copy()
     rec["reason"] = reason
     rec["input_task"] = task_text
+    rec["config_path"] = str(get_model_config_path(workspace_root=find_workspace_root()))
     return rec
 
 
@@ -534,9 +579,11 @@ def ensure_worker_pane(direction: str = "right", model: Optional[str] = None, fo
 
     # If model is requested, optionally initialize an agy-auto session in the new pane
     if new_pane_id and model:
+        ws = find_workspace_root()
+        resolved_init_model = resolve_model_for_tier(model, workspace_root=ws) if str(model).strip().lower() in ("low", "medium", "high") else model
         time.sleep(0.5)
         agy_bin = resolve_cmd("agy-auto")
-        run_herdr_cmd(["pane", "send-text", new_pane_id, f"{shlex.quote(agy_bin)} --model {model}\n"])
+        run_herdr_cmd(["pane", "send-text", new_pane_id, f"{shlex.quote(agy_bin)} --model {resolved_init_model}\n"])
 
     return {
         "status": "created",
@@ -551,6 +598,7 @@ def delegate_task(
     target_pane: str,
     task_prompt: str,
     model: Optional[str] = None,
+    tier: Optional[str] = None,
     role: Optional[str] = None,
     fresh: bool = False,
     reset_on_role_change: bool = False,
@@ -566,12 +614,13 @@ def delegate_task(
     1. Verify target pane is NOT the orchestrator pane (unless allow_self=True).
     2. Check target pane rate-limit status. If limited, ABORT immediately.
     3. Check if target pane is blocked on permission. If blocked, report error.
-    4. Apply lifecycle optimizations:
+    4. Resolve target model dynamically from explicit --model / --tier / role -> models.yaml.
+    5. Apply lifecycle optimizations:
        - /new if fresh=True or (reset_on_role_change=True and role changed)
        - /compact if compact=True or task_count_since_compact >= auto_compact_threshold
-       - /model <model> if model changed
-    5. Send task prompt to target.
-    6. Optionally wait for completion and fetch output.
+       - /model <model> if resolved target model changed
+    6. Send task prompt to target.
+    7. Optionally wait for completion and fetch output.
     """
     caller_pane = get_caller_pane_id()
     if target_pane == caller_pane and not allow_self:
@@ -598,6 +647,28 @@ def delegate_task(
             "indicators": limit_check["blocked_indicators"]
         }
 
+    ws = find_workspace_root()
+    explicit_tier = tier.strip().lower() if tier else None
+    resolved_tier: Optional[str] = None
+    explicit_model: Optional[str] = None
+
+    if model:
+        m_low = str(model).strip().lower()
+        if m_low in ("low", "medium", "high"):
+            resolved_tier = m_low
+            explicit_model = resolve_model_for_tier(resolved_tier, workspace_root=ws)
+        else:
+            resolved_tier = explicit_tier
+            explicit_model = model
+    elif explicit_tier:
+        resolved_tier = explicit_tier
+        explicit_model = resolve_model_for_tier(resolved_tier, workspace_root=ws)
+
+    role_tier: Optional[str] = None
+    role_model: Optional[str] = None
+    if role:
+        role_tier, role_model = resolve_role_tier_and_model(role, workspace_root=ws)
+
     marker_id = f"TASK_{int(time.time())}"
     decorated_prompt = (
         f"# [HERDR-DELEGATED TASK {marker_id}]\n"
@@ -606,9 +677,12 @@ def delegate_task(
 
     code_ag, stdout_ag, _ = run_herdr_cmd(["agent", "get", target_pane])
     has_agent = (code_ag == 0)
+    started_fresh_agent = False
+    started_model: Optional[str] = None
 
     if not has_agent:
-        agy_model = model or "gemini-3.8-flash-high"
+        agy_model = explicit_model or role_model or resolve_model_for_tier("medium", workspace_root=ws)
+        started_model = agy_model
         start_cmd = [
             "agent", "start", f"worker-{target_pane.replace(':', '_')}",
             "--kind", "agy", "--pane", target_pane,
@@ -624,30 +698,46 @@ def delegate_task(
             code_ag, _, _ = run_herdr_cmd(["agent", "get", target_pane])
             if code_ag == 0:
                 has_agent = True
+                started_fresh_agent = True
                 break
 
     # State tracking & lifecycle slash commands
     pane_state = load_pane_state()
     target_state = pane_state.get(target_pane, {})
-    last_role = target_state.get("active_role")
-    last_model = target_state.get("active_model")
+    last_role = None if started_fresh_agent else target_state.get("active_role")
+    last_model = started_model if started_fresh_agent else target_state.get("active_model")
     if not last_model:
         detected = detect_model_from_snippet(limit_check.get("recent_snippet", ""))
         if detected:
             last_model = detected
 
-    task_count = target_state.get("task_count_since_compact", 0)
+    task_count = 0 if started_fresh_agent else target_state.get("task_count_since_compact", 0)
+    should_reset = fresh or (reset_on_role_change and role and last_role and last_role != role)
 
-    lifecycle_actions = {
+    target_model: Optional[str] = explicit_model
+    if not target_model and role_model:
+        if should_reset or not last_model:
+            target_model = role_model
+
+    effective_model = target_model or last_model or started_model
+    effective_tier = resolved_tier or role_tier
+    model_spec = get_model_runtime_spec(effective_model, workspace_root=ws) if effective_model else {"source": None}
+
+    lifecycle_actions: Dict[str, Any] = {
         "context_reset_new": False,
         "context_compacted": False,
         "model_switched_to": None,
-        "role": role or last_role
+        "role": role or last_role,
+        "tier": effective_tier,
+        "resolved_model": effective_model,
+        "model_source": model_spec.get("source"),
     }
+    if model_spec.get("source") == "api_key":
+        lifecycle_actions["provider"] = model_spec.get("provider")
+        lifecycle_actions["api_key_env"] = model_spec.get("api_key_env")
 
     if has_agent:
         # A. Clean-Room Reset (/new)
-        should_reset = fresh or (reset_on_role_change and role and last_role and last_role != role)
         if should_reset:
             send_slash_command(target_pane, "/new")
             lifecycle_actions["context_reset_new"] = True
@@ -663,10 +753,12 @@ def delegate_task(
                 task_count = 0
 
         # C. Dynamic Model Switch (/model <model>)
-        if model and model != last_model:
-            send_slash_command(target_pane, f"/model {model}")
-            lifecycle_actions["model_switched_to"] = model
-            last_model = model
+        if target_model and target_model != last_model:
+            send_slash_command(target_pane, f"/model {target_model}")
+            lifecycle_actions["model_switched_to"] = target_model
+            last_model = target_model
+
+    final_active_model = target_model or last_model or started_model
 
     if has_agent:
         args = ["agent", "prompt", target_pane, decorated_prompt]
@@ -685,7 +777,7 @@ def delegate_task(
         # Update and persist pane state
         task_count += 1
         target_state["active_role"] = role or last_role
-        target_state["active_model"] = model or last_model
+        target_state["active_model"] = final_active_model
         target_state["task_count_since_compact"] = task_count
         target_state["last_task_at"] = datetime.datetime.now(datetime.timezone.utc).astimezone().isoformat()
         pane_state[target_pane] = target_state
@@ -715,7 +807,7 @@ def delegate_task(
         # Update and persist pane state
         task_count += 1
         target_state["active_role"] = role or last_role
-        target_state["active_model"] = model or last_model
+        target_state["active_model"] = final_active_model
         target_state["task_count_since_compact"] = task_count
         target_state["last_task_at"] = datetime.datetime.now(datetime.timezone.utc).astimezone().isoformat()
         pane_state[target_pane] = target_state
@@ -812,6 +904,58 @@ def run_orchestrated_task(
     }
 
 
+def handle_model_config_cmd(args) -> Dict[str, Any]:
+    """Manage centralized model configuration (show/sync/set-tier/add-api/remove-api)."""
+    ws = find_workspace_root()
+    action = getattr(args, "mc_action", "show")
+    if action == "show":
+        cfg = load_model_config(workspace_root=ws)
+        return {
+            "status": "success",
+            "config_path": str(get_model_config_path(workspace_root=ws)),
+            "version": cfg.get("version"),
+            "last_synced": cfg.get("last_synced"),
+            "tiers": cfg.get("tiers"),
+            "available_models_count": len(cfg.get("available_models", [])),
+            "available_models": cfg.get("available_models", []),
+            "api_key_models": cfg.get("api_key_models", []),
+        }
+    if action == "sync":
+        return sync_model_config_from_runtime(
+            auto_assign=not getattr(args, "no_auto_assign", False),
+            workspace_root=ws,
+            global_scope=getattr(args, "global_scope", False),
+        )
+    if action == "set-tier":
+        return set_tier_model_in_config(
+            tier=args.tier,
+            primary_model=args.model,
+            fallback_model=getattr(args, "fallback", None),
+            effort=getattr(args, "effort", None),
+            workspace_root=ws,
+            global_scope=getattr(args, "global_scope", False),
+        )
+    if action == "add-api":
+        return add_api_key_model_to_config(
+            model_id=args.model_id,
+            tier=args.tier,
+            provider=args.provider,
+            api_key_env=args.api_key_env,
+            display_name=getattr(args, "display_name", None),
+            base_url=getattr(args, "base_url", None),
+            set_primary=getattr(args, "set_primary", False),
+            workspace_root=ws,
+            global_scope=getattr(args, "global_scope", False),
+        )
+    if action == "remove-api":
+        return remove_api_key_model_from_config(
+            model_id=args.model_id,
+            workspace_root=ws,
+            global_scope=getattr(args, "global_scope", False),
+        )
+    return {"status": "error", "error": f"Unknown model-config action: {action}"}
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=f"herdr-orchestrator v{VERSION}: Cross-pane task orchestrator and adaptive model switcher for Herdr."
@@ -832,11 +976,40 @@ def main():
     p_mod = subparsers.add_parser("model-recommend", help="Classify task complexity and recommend optimal model.")
     p_mod.add_argument("task", help="Task description or complexity tag (low/medium/high)")
 
+    # model-config
+    p_mc = subparsers.add_parser("model-config", help="Manage centralized model tier configuration (models.yaml).")
+    mc_sub = p_mc.add_subparsers(dest="mc_action", required=True)
+    p_mc_show = mc_sub.add_parser("show", help="Show active centralized tier-to-model mappings.")
+    p_mc_show.add_argument("--json", action="store_true", help="Output raw JSON")
+    p_mc_sync = mc_sub.add_parser("sync", help="Sync available models from 'agy models' and optionally auto-assign tiers.")
+    p_mc_sync.add_argument("--no-auto-assign", action="store_true", help="Only update available_models list without changing tier primaries.")
+    p_mc_sync.add_argument("--global", dest="global_scope", action="store_true", help="Write to global ~/.gemini/team-orch/config/models.yaml")
+    p_mc_sync.add_argument("--json", action="store_true", help="Output raw JSON")
+    p_mc_set = mc_sub.add_parser("set-tier", help="Set primary/fallback model for a tier (low/medium/high).")
+    p_mc_set.add_argument("tier", choices=["low", "medium", "high"], help="Target tier")
+    p_mc_set.add_argument("model", help="Target model ID")
+    p_mc_set.add_argument("--fallback", help="Optional fallback model ID")
+    p_mc_set.add_argument("--effort", choices=["low", "medium", "high", "xhigh"], help="Optional reasoning effort")
+    p_mc_set.add_argument("--global", dest="global_scope", action="store_true", help="Write to global config")
+    p_mc_add = mc_sub.add_parser("add-api", help="Register a custom API-key (BYOK) model without storing raw keys.")
+    p_mc_add.add_argument("model_id", help="Model ID (e.g. gemini-2.5-pro or gpt-5)")
+    p_mc_add.add_argument("--tier", choices=["low", "medium", "high"], required=True, help="Target tier")
+    p_mc_add.add_argument("--provider", required=True, help="Provider name (e.g. google, openai, anthropic, openrouter)")
+    p_mc_add.add_argument("--api-key-env", required=True, help="Environment variable holding the API key (e.g. GEMINI_API_KEY)")
+    p_mc_add.add_argument("--display-name", help="Optional display name")
+    p_mc_add.add_argument("--base-url", help="Optional custom OpenAI-compatible/gateway base URL")
+    p_mc_add.add_argument("--set-primary", action="store_true", help="Also set this model as primary for the selected tier")
+    p_mc_add.add_argument("--global", dest="global_scope", action="store_true", help="Write to global config")
+    p_mc_rm = mc_sub.add_parser("remove-api", help="Remove a registered API-key model.")
+    p_mc_rm.add_argument("model_id", help="Model ID to remove")
+    p_mc_rm.add_argument("--global", dest="global_scope", action="store_true", help="Write to global config")
+
     # delegate
     p_del = subparsers.add_parser("delegate", help="Delegate a task to a non-limited worker pane.")
     p_del.add_argument("pane_id", help="Target worker pane ID")
     p_del.add_argument("prompt", help="Task prompt to send")
-    p_del.add_argument("--model", help="Optional model name override (e.g. gemini-3.8-flash-low)")
+    p_del.add_argument("--model", help="Optional model name or tier override (e.g. gemini-4-hydrogen-high or medium)")
+    p_del.add_argument("--tier", choices=["low", "medium", "high"], help="Optional tier override resolved via models.yaml")
     p_del.add_argument("--role", help="Target agent role name (e.g. coder, qa-engineer)")
     p_del.add_argument("--fresh", "--new", dest="fresh", action="store_true", help="Send /new before task to reset context")
     p_del.add_argument("--reset-on-role-change", action="store_true", help="Automatically send /new if target role changed")
@@ -862,7 +1035,7 @@ def main():
     # switch-model
     p_swm = subparsers.add_parser("switch-model", help="Send /model <model> to switch model on target pane.")
     p_swm.add_argument("pane_id", help="Target pane ID")
-    p_swm.add_argument("model", help="Target model name (e.g. gemini-3.8-flash-low)")
+    p_swm.add_argument("model", help="Target model name or tier (e.g. gemini-4-hydrogen-low or low)")
 
 
     # fetch
@@ -873,7 +1046,7 @@ def main():
     # ensure-worker
     p_ens = subparsers.add_parser("ensure-worker", help="Ensure an available worker pane exists.")
     p_ens.add_argument("--direction", default="right", choices=["right", "down"])
-    p_ens.add_argument("--model", help="Optional model to launch in new worker pane")
+    p_ens.add_argument("--model", help="Optional model or tier to launch in new worker pane")
     p_ens.add_argument("--force-new", action="store_true", help="Always split a new dedicated worker pane")
 
 
@@ -918,11 +1091,16 @@ def main():
         res = classify_task_complexity(args.task)
         print(json.dumps(res, indent=2))
 
+    elif args.command == "model-config":
+        res = handle_model_config_cmd(args)
+        print(json.dumps(res, indent=2))
+
     elif args.command == "delegate":
         res = delegate_task(
             args.pane_id,
             args.prompt,
             model=args.model,
+            tier=getattr(args, "tier", None),
             role=getattr(args, "role", None),
             fresh=getattr(args, "fresh", False),
             reset_on_role_change=getattr(args, "reset_on_role_change", False),

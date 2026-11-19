@@ -54,14 +54,17 @@ SKILL_DIR="${HOME}/.gemini/config/skills/team-orchestrator"
 GLOBAL_RULES="${HOME}/.gemini/GEMINI.md"
 
 echo -e "\n[*] Menyiapkan direktori framework..."
-mkdir -p "${INSTALL_DIR}/roles" "${INSTALL_DIR}/templates" "${INSTALL_DIR}/docs" "${INSTALL_DIR}/scripts" "${INSTALL_DIR}/knowledge" "${INSTALL_DIR}/domains" "${INSTALL_DIR}/skills"
+mkdir -p "${INSTALL_DIR}/config" "${INSTALL_DIR}/roles" "${INSTALL_DIR}/templates" "${INSTALL_DIR}/docs" "${INSTALL_DIR}/scripts" "${INSTALL_DIR}/knowledge" "${INSTALL_DIR}/domains" "${INSTALL_DIR}/skills"
 mkdir -p "${LOCAL_BIN}"
 mkdir -p "${SKILL_DIR}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-echo -e "[*] Menyalin Base Domain (roles, templates, docs, knowledge, skills)..."
+echo -e "[*] Menyalin Base Domain (config, roles, templates, docs, knowledge, skills)..."
+if [ -d "${REPO_DIR}/.agents/config" ]; then
+    cp -r "${REPO_DIR}/.agents/config/"* "${INSTALL_DIR}/config/"
+fi
 if [ -d "${REPO_DIR}/.agents/roles" ]; then
     cp -r "${REPO_DIR}/.agents/roles/"* "${INSTALL_DIR}/roles/"
 fi
@@ -86,6 +89,10 @@ DOM_EOF
 fi
 
 echo -e "[*] Memasang CLI tools ke ${LOCAL_BIN}..."
+if [ -f "${REPO_DIR}/cmd/comm_io.py" ]; then
+    cp "${REPO_DIR}/cmd/comm_io.py" "${INSTALL_DIR}/comm_io.py"
+fi
+
 if [ -f "${REPO_DIR}/cmd/team-orch" ]; then
     cp "${REPO_DIR}/cmd/team-orch" "${INSTALL_DIR}/team-orch"
     chmod +x "${INSTALL_DIR}/team-orch"
@@ -144,23 +151,23 @@ Sistem orkestrator tim rekayasa perangkat lunak otonom terintegrasi dengan Herdr
 
 ## 1. Peran Tim & Hierarki
 
-1. **Project Manager (PM)** (`gemini-3.8-flash-high`):
+1. **Project Manager (PM)** (`Tier: medium` via `.agents/config/models.yaml`):
    - **Komunikasi Manusia**: Berdialog dengan pengguna dalam bahasa manusia yang ramah, ringkas, dan empatik.
    - **Proactive Clarification**: Dilarang berasumsi. Jika ada ambiguitas logika bisnis atau batasan sistem, PM wajib bertanya balik ke Pengguna sebelum menyusun dokumen kebutuhan.
    - **Output**: `tasks/<project_id>/01-requirements.md` (Wajib persetujuan Pengguna / Approval Gate).
 
-2. **Analis / Senior Lead Engineer (Tech Lead)** (`gemini-3.1-pro-high`):
+2. **Analis / Senior Lead Engineer (Tech Lead)** (`Tier: high` via `.agents/config/models.yaml`):
    - **Audit Boilerplate**: Menyelidiki struktur direktori, konvensi penamaan, dan utilitas yang sudah ada di repositori sebelum merancang kode baru.
    - **Technical Stewardship**: Menjaga Clean Code, keamanan (no hardcoded secrets, input sanitasi), prinsip SOLID, dan performa.
    - **Bukan Sekadar Tes Hijau**: Unit test adalah syarat minimal, Analis wajib menilai kualitas kode dan kesesuaian kebutuhan.
    - **Output**: `02-technical-spec.md`, `03-task-list.md`, dan `review-log.md`.
 
-3. **Coder (Software Developer)** (`gemini-3.8-flash-high`):
+3. **Coder (Software Developer)** (`Tier: medium` via `.agents/config/models.yaml`):
    - Mengimplementasikan sub-task atomik sesuai spesifikasi teknis.
    - Wajib menyertakan unit test menyeluruh dan menjalankannya sampai 100% *PASS*.
    - Tidak boleh memodifikasi Git (`git add`, `git commit`, `git push` dilarang).
 
-4. **Dokumenter** (`gemini-3.8-flash-low`):
+4. **Dokumenter** (`Tier: low` via `.agents/config/models.yaml`):
    - Menyusun dokumentasi teknis dan panduan pemakaian di folder `docs/`.
 
 ---

@@ -24,19 +24,21 @@ This skill empowers Antigravity to act as a central **Orchestrator** across term
 
 ---
 
-## 2. Model Auto-Switching Matrix
+## 2. Model Auto-Switching Matrix (Centralized via `.agents/config/models.yaml`)
 
-Evaluate every task before execution or delegation:
+Role files and complexity classifications only declare a tier (`low`, `medium`, `high`). Concrete model IDs are resolved dynamically from `.agents/config/models.yaml` so updating the central config immediately applies to all roles and next workers:
 
-| Complexity Tier | Characteristics & Task Types | Target Model (`agy`) | Effort | Subagent Model (`invoke_subagent`) | Token Economy Impact |
+| Complexity Tier | Characteristics & Task Types | Default Primary (`models.yaml`) | Effort | Subagent Model (`invoke_subagent`) | Token Economy Impact |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **LOW (Simple)** | Grep, file lookups, log reads, git status/diff, syntax checks, single unit test runs, code formatting, health checks. | `gemini-3.8-flash-low` | `low` | `flash_lite` or `flash` | **~85-90% quota savings**. Minimal tokens, fastest response. |
-| **MEDIUM (Standard)** | Feature implementation, bug fixes, multi-file code review, unit test authoring, standard refactoring. | `gemini-3.8-flash-high` / `claude-sonnet-4-6` | `medium` | `flash` or `inherit` | Balanced accuracy and token consumption. |
-| **HIGH (Complex)** | System architecture redesign, multi-repo distributed logic, security vulnerability audits, deep mathematical/algorithmic reasoning. | `gemini-3.1-pro-high` / `claude-opus-4-6-thinking` | `high` | `pro` | Premium reasoning tokens. Use selectively. |
+| **LOW (Simple)** | Grep, file lookups, log reads, git status/diff, syntax checks, single unit test runs, code formatting, health checks. | `gemini-4-hydrogen-low` | `low` | `flash_lite` or `flash` | **~85-90% quota savings**. Minimal tokens, fastest response. |
+| **MEDIUM (Standard)** | Feature implementation, bug fixes, multi-file code review, unit test authoring, standard refactoring. | `gemini-4-hydrogen-high` *(fallback: `claude-sonnet-5-5-high`)* | `medium` | `flash` or `inherit` | Balanced accuracy and token consumption. |
+| **HIGH (Complex)** | System architecture redesign, multi-repo distributed logic, security vulnerability audits, deep mathematical/algorithmic reasoning. | `gemini-4-argon-high` *(fallback: `claude-opus-5-5-high`)* | `high` | `pro` | Premium reasoning tokens. Use selectively. |
 
-To automatically classify any prompt:
+To automatically classify any prompt or sync new runtime models:
 ```bash
 herdr-orch model-recommend "<task prompt or description>"
+herdr-orch model-config show
+herdr-orch model-config sync
 ```
 
 ---
@@ -68,11 +70,14 @@ herdr-orch check-limit <target_pane_id>
 - If `"is_rate_limited": true`: **DO NOT DELEGATE**. Select another pane or run locally with a low-tier model.
 - If `"is_blocked": true`: Inspect the pane prompt (`herdr-orch fetch <target_pane_id>`) and notify user if approval is needed.
 
-### Step 4: Delegate the Task with Appropriate Model
-Delegate the task using the recommended model:
+### Step 4: Delegate the Task with Appropriate Model or Tier
+Delegate the task using a resolved model, tier (`--tier`), or role (`--role`):
 ```bash
-# Example: Simple task delegated to w1:p4 with flash-low
-herdr-orch delegate <target_pane_id> "Check git status and find all modified .py files" --model gemini-3.8-flash-low
+# Example: Simple task delegated to w1:p4 using centralized tier resolution
+herdr-orch delegate <target_pane_id> "Check git status and find all modified .py files" --tier low
+
+# Or let --role resolve its tier dynamically via .agents/config/models.yaml
+herdr-orch delegate <target_pane_id> "Audit QA matrix" --role qa-engineer --reset-on-role-change
 
 # Or high-level end-to-end orchestration:
 herdr-orch run-task "Run test suite on user auth module" --complexity medium
@@ -97,16 +102,18 @@ Review the returned output, integrate the findings into your master plan, and pr
 
 ---
 
-## 5. CLI Quick Reference (`herdr-orch` v0.4.0)
+## 5. CLI Quick Reference (`herdr-orch` v0.5.0)
 
 - `herdr-orch status`: Full workspace topology and health check.
 - `herdr-orch check-limit <pane>`: Inspects recent pane lines for quota/rate limit errors and blocked prompts.
 - `herdr-orch model-recommend "<task>"`: Suggests tier, model, and effort for a given task.
-- `herdr-orch delegate <pane> "<prompt>" [--model <model>] [--role <role>] [--reset-on-role-change] [--fresh] [--compact] [--auto-compact-threshold <N>]`: Safely dispatches task with lifecycle optimizations.
+- `herdr-orch model-config <show|sync|set-tier|add-api|remove-api>`: Inspect or update centralized `.agents/config/models.yaml` (auto-sync from `agy models`, change tier primary/fallback, or register API-key BYOK models).
+- `team-orch model <show|sync|set-tier|add-api|remove-api>`: Team-orch wrapper for centralized model tier configuration.
+- `herdr-orch delegate <pane> "<prompt>" [--model <model>] [--tier low|medium|high] [--role <role>] [--reset-on-role-change] [--fresh] [--compact] [--auto-compact-threshold <N>]`: Safely dispatches task with lifecycle & dynamic model optimizations.
 - `herdr-orch btw <pane> "<question>"`: Sends non-blocking `/btw <question>` without polluting primary context.
 - `herdr-orch compact <pane>`: Manually triggers `/compact` on target pane.
 - `herdr-orch reset <pane>`: Manually triggers `/new` on target pane (clean-room reset).
-- `herdr-orch switch-model <pane> <model>`: Manually switches active model via `/model <model>`.
+- `herdr-orch switch-model <pane> <model_or_tier>`: Manually switches active model via `/model <model>`.
 - `herdr-orch fetch <pane> [--lines <n>]`: Reads clean unwrapped response from worker pane.
 - `herdr-orch ensure-worker [--direction right|down]`: Splits new sibling pane if needed.
 - `herdr-orch run-task "<prompt>" [--complexity low|medium|high]`: Automated end-to-end dispatch.

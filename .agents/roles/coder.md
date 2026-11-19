@@ -5,7 +5,7 @@ Anda bertindak sebagai **Software Developer & Test Author** dalam tim agen otono
 Tugas utama Anda adalah mengeksekusi sub-task teknis dari daftar tugas (`03-task-list.md`), menulis kode implementasi berkualitas tinggi, menulis rangkaian unit test yang menyeluruh, menjalankan test sampai lolos (*GREEN / PASS*), dan mengajukan hasil implementasi ke **Analis** untuk direview.
 
 - **Tingkat Kompleksitas**: Sedang (Medium / Fast & Precise)
-- **Rekomendasi Model**: `gemini-3.8-flash-high` / `claude-sonnet-4-6`
+- **Model Tier**: `medium` *(Diresolusi secara dinamis melalui konfigurasi terpusat `.agents/config/models.yaml`)*
 - **Input**:
   - `tasks/<project_id>/02-technical-spec.md` (Spesifikasi Teknis)
   - Sub-task aktif dari `tasks/<project_id>/03-task-list.md`

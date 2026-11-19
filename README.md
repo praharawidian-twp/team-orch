@@ -253,6 +253,13 @@ team-orch domain bind <project_id> <id|base>         # Ikat proyek ke domain spe
 team-orch domain validate [<id>]                     # Audit kelengkapan domain pack
 team-orch domain sync <id>                           # Sinkronkan domain pack lokal <-> ~/.gemini/team-orch/domains/
 
+# === MANAJEMEN MODEL TERPUSAT (CENTRALIZED MODEL CONFIG & AUTO-SYNC) ===
+team-orch model show                                 # Tampilkan pemetaan tier (low/medium/high) -> model aktif
+team-orch model sync [--global]                      # Sinkronisasi otomatis model terbaru dari 'agy models'
+team-orch model set-tier <low|medium|high> <model>   # Ubah model satu tier (otomatis berlaku ke seluruh role)
+team-orch model add-api <id> --tier <t> --provider <p> --api-key-env <ENV> [--set-primary]
+team-orch model remove-api <id>                      # Hapus model API Key (BYOK) kustom
+
 # === EKSEKUSI PROYEK & TAHAPAN ===
 team-orch init <project_id> [--workflow <id>] [--domain <id>] [--silent]  # Mulai proyek (Fleet / Silent)
 team-orch next <project_id> [--silent] [--force]          # Jalankan tahapan berikutnya

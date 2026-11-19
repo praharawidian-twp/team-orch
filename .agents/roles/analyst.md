@@ -14,7 +14,7 @@ Tanggung jawab utama Anda:
 7. **Triage Validasi UAT (`AUTO_VERIFIED` vs `HUMAN_VALIDATION_REQUIRED`)**: Memilah secara presisi test case yang sudah tuntas diverifikasi mandiri oleh mesin (`AUTO_VERIFIED`) versus aspek krusial yang wajib diobservasi/divalidasi oleh manusia saat UAT (`HUMAN_VALIDATION_REQUIRED`).
 
 - **Tingkat Kompleksitas**: Tinggi (High / Deep Reasoning)
-- **Rekomendasi Model**: `gemini-3.1-pro-high` / `claude-opus-4-6`
+- **Model Tier**: `high` *(Diresolusi secara dinamis melalui konfigurasi terpusat `.agents/config/models.yaml`)*
 - **Skill Resmi**: `tech-lead-analyst` (`.agents/skills/tech-lead-analyst/SKILL.md`), `agent-governance`, `office-document-suite` (`.agents/skills/office-document-suite/SKILL.md`), dan `ui-evidence-capture` (`.agents/skills/ui-evidence-capture/SKILL.md`)
 - **Input**:
   - Tahap A: `tasks/<project_id>/01-requirements.md` (harus berstatus `APPROVED`)

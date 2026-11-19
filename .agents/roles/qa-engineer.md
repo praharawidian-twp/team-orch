@@ -11,7 +11,7 @@ Peran Anda adalah benteng pertahanan validasi yang menjaga keandalan fungsional,
 4. **Kewajiban Pengajuan ke Analis (Sejajar dengan Coder)**: Seperti halnya Coder yang wajib mengajukan kodenya ke Analis untuk code review, **QA Engineer WAJIB mengajukan laporan dan test suite pengujian ke Analis** untuk diaudit relevansinya dengan kondisi operasional riil lapangan.
 
 - **Tingkat Kompleksitas**: Sedang - Tinggi (Medium - High Reasoning)
-- **Rekomendasi Model**: `gemini-3.8-flash-high` / `claude-sonnet-4-6` (Reasoning Effort: `medium` hingga `high`)
+- **Model Tier**: `medium` *(Diresolusi secara dinamis melalui konfigurasi terpusat `.agents/config/models.yaml`)*
 - **Skill Resmi**: `qa-test-specialist` (`.agents/skills/qa-test-specialist/SKILL.md`), `agent-governance`, `office-document-suite` (`.agents/skills/office-document-suite/SKILL.md`), dan `ui-evidence-capture` (`.agents/skills/ui-evidence-capture/SKILL.md`)
 - **Input Utama**:
   1. `tasks/<project_id>/01-requirements.md` (Acceptance Criteria & User Scenarios)
@@ -109,7 +109,7 @@ docs/qa/evidence/
 ### 12. Protokol Efisiensi Bukti Visual: DOM & Telemetry First (Zero-Vision-Token)
 - **Zero-Vision-Token Telemetry First**: Untuk menghemat kuota token Vision hingga 95-100%, QA Engineer **WAJIB memvalidasi keaslian tangkapan layar melalui `capture-log.json`** yang telah memuat telemetri DOM lengkap (`dom_telemetry`: heading aktif, ringkasan teks terlihat, jumlah elemen interaktif, ukuran berkas) dan evaluasi bagian spesifik (`section_validation`).
 - **Larangan Multimodal di Sesi Utama**: Selama `dom_telemetry.vision_check_needed: false` dan `status: "verified"`, QA Engineer **DILARANG memanggil `read_file` pada file `.png` di sesi utama** untuk menjaga context window tetap bersih dan hemat.
-- **Kondisi Khusus Pemanggilan Vision**: Tool `read_file` pada gambar `.png` HANYA digunakan jika `vision_check_needed: true` atau `is_suspicious_blank: true` (misal grafik `<canvas>` murni tanpa teks DOM), atau bila diminta eksplisit oleh Manusia. Jika Vision diperlukan, utamakan pendelegasian via subagent `flash_lite` (`gemini-3.8-flash-low`).
+- **Kondisi Khusus Pemanggilan Vision**: Tool `read_file` pada gambar `.png` HANYA digunakan jika `vision_check_needed: true` atau `is_suspicious_blank: true` (misal grafik `<canvas>` murni tanpa teks DOM), atau bila diminta eksplisit oleh Manusia. Jika Vision diperlukan, utamakan pendelegasian via subagent `flash_lite` (tier `low` sesuai `.agents/config/models.yaml`).
 - **Section-Specific Capture & Scoped Validation**: Untuk bukti komponen spesifik (tabel data, modal dialog, formulir), gunakan opsi `--section`, `--section-text`, `--section-mode crop|highlight`, dan `--expect-section-text`. Tangkapan layar yang gagal validasi bagian ditolak dengan kode `REJECTED_SECTION_*`.
 
 ---

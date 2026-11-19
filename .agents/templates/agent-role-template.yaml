@@ -9,10 +9,11 @@ id: "custom-role-id"
 title: "Senior Specialist Title"
 description: "Tanggung jawab utama agen dalam organisasi tim virtual."
 
-# Tingkat model AI:
-# - low    : gemini-3.8-flash-low (Task ringan: grep, baca berkas, format, lint)
-# - medium : gemini-3.8-flash-high (Fitur umum, penulisan kode, unit test)
-# - high   : gemini-3.1-pro-high  (Arsitektur, review Tech Lead, audit keamanan)
+# Tingkat model AI (Single Source of Truth ada di .agents/config/models.yaml):
+# - low    : Task ringan (grep, baca berkas, dokumentasi, lint)
+# - medium : Tugas standar (fitur umum, penulisan kode, unit test, QA)
+# - high   : Tugas kompleks (arsitektur, review Tech Lead, audit keamanan)
+# Jalankan `team-orch model show` untuk melihat model aktif per tier.
 model_tier: "medium"
 
 # Pengaturan Terminal Pane Herdr:
